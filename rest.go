@@ -96,8 +96,8 @@ func (c *ghClient) restFetch(ctx context.Context, r repoRef, number int, head st
 			return nil, err
 		}
 		for _, f := range files {
-			if ref := contentsRef(f); ref != "" && !strings.EqualFold(ref, head) {
-				return nil, &staleError{Head: strings.ToLower(ref)}
+			if ref := contentsRef(f); ref != "" && ref != head {
+				return nil, &staleError{Head: ref}
 			}
 			out = append(out, f.restFile)
 		}
@@ -108,7 +108,11 @@ func (c *ghClient) restFetch(ctx context.Context, r repoRef, number int, head st
 	return out, nil
 }
 
-// contentsRef is the commit a file's contents_url names, or "".
+// contentsRef is the commit a file's contents_url names, lowercased, or "".
+// A ref that isn't a commit id (a branch name, say, from a server that puts
+// one there) counts as none, so nothing GitHub's REST answer says that
+// isn't a commit id is ever used: the head reads around the fetch are the
+// guard then.
 func contentsRef(f restFileWire) string {
 	if f.Status == "removed" || f.ContentsURL == "" {
 		return ""
@@ -117,7 +121,11 @@ func contentsRef(f restFileWire) string {
 	if err != nil {
 		return ""
 	}
-	return u.Query().Get("ref")
+	ref := strings.ToLower(u.Query().Get("ref"))
+	if !headPattern.MatchString(ref) {
+		return ""
+	}
+	return ref
 }
 
 // prHead is a PR's node ID and its head commit, the least it takes to

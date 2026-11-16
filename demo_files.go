@@ -39,6 +39,9 @@ func demoPatch(hunks ...demoHunk) string {
 	for _, h := range hunks {
 		var o, n int
 		for _, r := range h.rows {
+			if r == "" {
+				continue
+			}
 			switch r[0] {
 			case ' ':
 				o++

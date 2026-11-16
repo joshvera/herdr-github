@@ -211,6 +211,25 @@ func TestOpDiffStaleWhenRESTNamesAnotherCommit(t *testing.T) {
 	}
 }
 
+// A contents_url ref that isn't a commit id is no ref: the diff is answered
+// and the files kept (the head reads around the fetch are the guard), and
+// nothing from the ref reaches the answer.
+func TestOpDiffIgnoresARefThatIsNotACommitID(t *testing.T) {
+	for _, ref := range []string{"main", "%1b%5d52%3bc%3bZXZpbA%3d%3d%07main"} {
+		cacheFixture(t)
+		gql := &opsGraphQL{t: t, heads: []string{headA}}
+		files := []restFile{{Filename: "a.rb", Status: "modified", Changes: 2, SHA: "1", Patch: "@@ -1 +1 @@\n-a\n+b"}}
+		fakeGitHubREST(t, gql.handler(), restFilesPages(t, files, 100, ref, nil))
+		got := opRun(t, diffReq(headA, "a.rb"))
+		if got["state"] != "ok" || got["head"] != headA || got["error"] != nil {
+			t.Errorf("ref %q: %v", ref, got)
+		}
+		if _, ok := readDiffCache(testRepo, 7, headA); !ok {
+			t.Errorf("ref %q: the files weren't kept", ref)
+		}
+	}
+}
+
 func TestOpDiffRESTFailureIsAnError(t *testing.T) {
 	cacheFixture(t)
 	gql := &opsGraphQL{t: t, heads: []string{headA}}

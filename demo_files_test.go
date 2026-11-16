@@ -254,3 +254,11 @@ func TestDemoHeadsAreCommitIDs(t *testing.T) {
 		}
 	}
 }
+
+// A demo row with nothing in it is skipped, not indexed.
+func TestDemoPatchSurvivesAnEmptyRow(t *testing.T) {
+	got := demoPatch(demoHunk{oldStart: 1, newStart: 1, rows: []string{" a", "", "-b", "+c"}})
+	if want := "@@ -1,2 +1,2 @@\n a\n\n-b\n+c"; got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}

@@ -170,6 +170,20 @@ func TestRestFilesWithNoRefPass(t *testing.T) {
 	}
 }
 
+// A ref that isn't a commit id (a branch name, or text with an escape in it
+// from a server that doesn't say what it means) is no ref at all: the files
+// pass, and nothing from it can reach an answer.
+func TestRestRefThatIsNotACommitIDIsNoRef(t *testing.T) {
+	files := []restFile{{Filename: "kept.go", Status: "modified", Changes: 2, SHA: "y", Patch: "@@ -1 +1 @@\n-a\n+b"}}
+	for _, ref := range []string{"main", "%1b%5d52%3bc%3bZXZpbA%3d%3d%07main", headA[:39], headA + "0"} {
+		fakeGitHubREST(t, nil, restFilesPages(t, files, 100, ref, nil))
+		got, err := newClient("github.com").restFetch(context.Background(), testRepo, 7, headA)
+		if err != nil || len(got) != 1 {
+			t.Errorf("ref %q: %v %v", ref, got, err)
+		}
+	}
+}
+
 // The patch is kept raw: it's parsed into rows before anything cleans it.
 func TestRestKeepsThePatchRaw(t *testing.T) {
 	files := []restFile{{Filename: "a.go", Status: "modified", Changes: 2, SHA: "y", Patch: "@@ -1 +1 @@\n-a\r\n+b\x1b[31m"}}

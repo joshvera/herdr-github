@@ -279,7 +279,9 @@ func lowerOr(s, fallback string) string {
 }
 
 // shapeThread is a thread as the mod gets it. GitHub gives startLine == line
-// for a single-line thread, which becomes 0 and ""; the first comment's hunk
+// for a single-line thread (both on one side), which becomes 0 and ""; a
+// thread from one side's line to the other side's line of the same number is
+// still multi-line; the first comment's hunk
 // is only sent for a line thread with no line to place it on.
 func shapeThread(g gqlThread) fileThread {
 	t := fileThread{
@@ -287,8 +289,8 @@ func shapeThread(g gqlThread) fileThread {
 		Side: lowerOr(g.DiffSide, "right"), OriginalLine: g.OriginalLine,
 		Resolved: g.IsResolved, Outdated: g.IsOutdated, Comments: []threadComment{},
 	}
-	if g.StartLine != 0 && g.StartLine != g.Line {
-		t.StartLine, t.StartSide = g.StartLine, lowerOr(g.StartDiffSide, t.Side)
+	if startSide := lowerOr(g.StartDiffSide, t.Side); g.StartLine != 0 && (g.StartLine != g.Line || startSide != t.Side) {
+		t.StartLine, t.StartSide = g.StartLine, startSide
 	}
 	if t.Line == 0 && t.Subject == "line" && len(g.Hunk.Nodes) > 0 {
 		t.Hunk = g.Hunk.Nodes[0].DiffHunk

@@ -166,6 +166,9 @@ func TestFilesThreadShapes(t *testing.T) {
 		threadNode("nullstart", "a.rb", map[string]any{"line": 8, "startLine": nil, "startDiffSide": nil}),
 		// A multi-line thread, from the old file's line 4 to the new file's line 9.
 		threadNode("multi", "a.rb", map[string]any{"line": 9, "startLine": 4, "diffSide": "RIGHT", "startDiffSide": "LEFT"}),
+		// A multi-line thread across sides that starts and ends on one number:
+		// a one-line replacement (-x at old 5, +y at new 5) commented on whole.
+		threadNode("crossside", "a.rb", map[string]any{"line": 5, "startLine": 5, "diffSide": "RIGHT", "startDiffSide": "LEFT"}),
 		// Outdated, but it still has a line.
 		threadNode("outdated-line", "a.rb", map[string]any{"line": 12, "startLine": 12, "isOutdated": true, "originalLine": 11}),
 		// Outdated with no line: the hunk says what it was about, newlines kept.
@@ -199,6 +202,7 @@ func TestFilesThreadShapes(t *testing.T) {
 	check("single", fileThread{Subject: "line", Line: 7, Side: "right", OriginalLine: 10})
 	check("nullstart", fileThread{Subject: "line", Line: 8, Side: "right", OriginalLine: 10})
 	check("multi", fileThread{Subject: "line", Line: 9, Side: "right", StartLine: 4, StartSide: "left", OriginalLine: 10})
+	check("crossside", fileThread{Subject: "line", Line: 5, Side: "right", StartLine: 5, StartSide: "left", OriginalLine: 10})
 	check("outdated-line", fileThread{Subject: "line", Line: 12, Side: "right", OriginalLine: 11, Outdated: true})
 	check("outdated-noline", fileThread{Subject: "line", Line: 0, Side: "left", OriginalLine: 5, Outdated: true, Hunk: "@@ -3,2 +3,2 @@\n ctx\n-gone"})
 	check("file", fileThread{Subject: "file", Side: "right"})
