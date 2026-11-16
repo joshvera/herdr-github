@@ -16,6 +16,7 @@ import { agents, panes, machines, spaces, run, exec, theme, appHome, props, clos
 import { demoAgents, DEMO_REPO } from "./demo.js";
 import { tones, tint, countPill, groupOf, toneColor, prLook, checkLook, ago, icon, chip, words, key, cap, MONO } from "./look.js";
 import { PR_TABS, tabFor, prRoute } from "./prkeys.js";
+import { FilesView } from "./files.js";
 
 // The herdr-github this mod is part of (its release; the repo's tests hold it
 // to herdr-plugin.toml's version).
@@ -205,47 +206,6 @@ function place(s) {
   return panes().find((p) => tabs.has(p.tab) && p.cwd)?.cwd || s.folder || null;
 }
 
-// The Files changed tab until its view (files.js) is built: its count, and a
-// word that it's coming. That view takes this one's place (openPR makes one
-// per PR) with the same methods:
-//   key(k, cx)   every key on the tab first; true when it took it
-//   escape(cx)   esc on the tab first; true when it took it (its filter)
-//   shown(cx)    the tab came into view: load what it shows
-//   reload(cx)   github.reload while it's shown
-//   link()       what o opens and y copies
-//   view(o)      the tab's body
-//   footer(k)    its keys for the footer, before tabs and esc
-class ComingFiles {
-  constructor(gh) {
-    this.gh = gh;
-  }
-  key(_k, _cx) {
-    return false;
-  }
-  escape(_cx) {
-    return false;
-  }
-  shown(_cx) {}
-  reload(_cx) {}
-  link() {
-    return this.gh.cur?.url ? `${this.gh.cur.url}/files` : "";
-  }
-  view(o) {
-    const d = this.gh.detail;
-    return v_flex().flex_1().min_h(0).gap(8).p(14)
-      .child(h_flex().gap(8).items_center()
-        .child(div().text_size(15).font_semibold().text_color(o.fg).child("Files changed"))
-        .child(countPill(o, d ? String(d.files) : "", true)))
-      .child(div().text_size(12.8).text_color(o.dim).child("Its files and their diffs will show here in a coming version. Until then, o opens them on GitHub."));
-  }
-  footer(k) {
-    return [
-      k(["o"], "GitHub", (cx) => this.gh.open(this.link(), cx), "f-o"),
-      k(["y"], "copy link", (cx) => this.gh.copy(this.link(), cx), "f-y"),
-    ];
-  }
-}
-
 export default class GitHub extends View {
   init(_props, cx) {
     const p = props() ?? {};
@@ -262,7 +222,7 @@ export default class GitHub extends View {
     this.parked = null; // a menu that came while Overview wasn't shown
     this.checkAt = 0; // the chosen check, on the Checks tab
     this.checkScroll = ScrollHandle.new();
-    this.files = null; // the Files changed tab's view, one per PR opened
+    this.files = null; // the Files changed tab's view (files.js), one per PR opened
     this.flash = "";
     this.err = "";
     this.busy = "";
@@ -302,6 +262,15 @@ export default class GitHub extends View {
     });
     this.input.focus();
     cx.timer.after(400, () => this.screen === "list" && this.input.focus());
+
+    // The Files tab's filter and its lists' positions: made here, as state
+    // has to be, and handed to each PR's FilesView.
+    const filter = InputState.new({ placeholder: "Filter files by path" });
+    filter.on("change", (_e, cx) => this.files?.filterChanged(filter.value(), cx));
+    filter.on("focus", (_e, cx) => this.files?.filterFocus(true, cx));
+    filter.on("blur", (_e, cx) => this.files?.filterFocus(false, cx));
+    filter.on("submit", (_e, cx) => this.files?.typingKey("enter", cx));
+    this.filesUI = { filter, diffScroll: VirtualListScrollHandle.new(), treeScroll: VirtualListScrollHandle.new(), height: PR_BODY_H };
 
     cx.spawn(async (cx) => {
       await this.readCache(cx);
@@ -556,7 +525,7 @@ export default class GitHub extends View {
     this.prTab = "overview";
     this.menu = this.parked = null;
     this.checkAt = 0;
-    this.files = new ComingFiles(this);
+    this.files = new FilesView(this, this.filesUI);
     this.err = this.flash = "";
     this.direct = direct;
     this.loadDetail(cx);
@@ -996,6 +965,24 @@ export default class GitHub extends View {
     cx.notify();
   }
 
+  // A key pressed in the popup. While the Files tab's filter has the
+  // keyboard the key is the filter's: it isn't stopped (so it types), and
+  // only the Files view sees it (enter, ↑ ↓); escape still leaves the filter.
+  keyDown(e, cx) {
+    const k = e.keystroke;
+    if (k === "escape") this.escape(cx);
+    else if (this.filesTyping()) {
+      this.files.typingKey(k, cx);
+      return cx.notify();
+    } else if (!this.press(k, cx, Boolean(e.is_held))) return;
+    cx.stop_propagation();
+    cx.notify();
+  }
+
+  filesTyping() {
+    return this.screen === "pr" && this.prTab === "files" && Boolean(this.files?.typing);
+  }
+
   // One key, from on_key_down (`held` when it's a repeat) or a command
   // (tab, shift-tab): whether it was this screen's.
   press(k, cx, held = false) {
@@ -1013,7 +1000,7 @@ export default class GitHub extends View {
   // tab's view has every key first; what it declines never reaches a menu
   // or the PR's actions.
   prKey(k, cx, held) {
-    if (this.prTab === "files" && this.files?.key(k, cx)) return true;
+    if (this.prTab === "files" && this.files?.key(k, cx, held)) return true;
     switch (prRoute(k, this.prTab, Boolean(this.menu))) {
       case "menu":
         return this.menuKey(k, cx, held);
@@ -1537,7 +1524,8 @@ export default class GitHub extends View {
     if (this.screen === "pr") {
       const tabs = k(["1", "2", "3"], "tabs", (cx) => this.setPrTab(tabFor("tab", this.prTab), cx), "f-tabs");
       const back = k(["esc"], "back", (cx) => this.escape(cx), "f-esc");
-      if (this.prTab === "files") return [...this.files.footer(k), tabs, back];
+      // While its filter has the keyboard, 1 2 3 and esc are the filter's.
+      if (this.prTab === "files") return this.files.typing ? this.files.footer(k) : [...this.files.footer(k), tabs, back];
       if (this.prTab === "checks") {
         return [
           k(["↑", "↓"], "choose", () => {}, "f-ch"),
@@ -1596,13 +1584,7 @@ export default class GitHub extends View {
           cx.notify();
         }
       })
-      .on_key_down((e, cx) => {
-        const k = e.keystroke;
-        if (k === "escape") this.escape(cx);
-        else if (!this.press(k, cx, Boolean(e.is_held))) return;
-        cx.stop_propagation();
-        cx.notify();
-      })
+      .on_key_down((e, cx) => this.keyDown(e, cx))
       .when(!pr, (el) => el
         .child(
           h_flex().h(36).flex_none().px(12).gap(10).items_center().rounded(9).border_1().border_color(o.line).bg(o.sunk)

@@ -14,6 +14,10 @@ you're on:
   or place in the merge queue, labels, worktree and agents.
 - **Can it merge, and if not, why not,** in one line, with the failing
   checks by name, the reviewers, and the description and conversation.
+- **Its code, with its review threads,** without a checkout: the changed
+  files as a tree, one file's diff, and each thread between the lines it's
+  on. One key each for the next line, file, unresolved thread or file not
+  yet viewed, and to mark one viewed.
 - **Merge from here:** any method the repo allows, auto-merge, or its merge
   queue; then delete the branch and remove the worktree. Draft ↔ ready with
   a key.
@@ -121,8 +125,15 @@ filter, ← → for the tabs, ↑ ↓ and Enter. On a PR, three tabs: `1` Overvi
 (`keys.json` binds both to the mod, since the app keeps them otherwise). On
 Overview: `w` worktree, `s` start an agent, `m` merge, `d` draft ↔ ready, `a`
 agents, `l` its Linear issue (in herdr-linear's Linear mod). On Checks: ↑ ↓
-and Enter to open a check's run. On every tab: `o` open on GitHub, `y` copy
-the link, `r` reload. The keys that change a PR never act on Files changed.
+and Enter to open a check's run. On Files changed: `j` `k` (↑ ↓) a line,
+`]` `[` the next or previous file, `n` `p` the next or previous unresolved
+thread (across files), `u` the next file not viewed, `v` mark the file viewed
+(then on to the next not viewed) or not, Enter fold or unfold the thread
+under the cursor, `/` filter the files by path (keys type into it; Enter
+keeps it, `escape` clears it, and neither leaves the screen). Only movement
+repeats when held. On every tab: `o` open on GitHub (on Files changed, the
+file's diff, or the comment under the cursor), `y` copy the link, `r` reload.
+The keys that change a PR never act on Files changed.
 A menu that comes on its own (cleaning up after a merge, a missing checkout)
 opens on its do-nothing item and takes only ↑ ↓ and Enter, never `1`-`9`, and
 a held key never chooses in any menu.
