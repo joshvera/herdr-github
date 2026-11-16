@@ -655,6 +655,12 @@ export default class GitHub extends View {
 
   // A menu, on Overview: shown at once there; one that comes while another
   // tab is shown (after a merge, a worktree's question) waits for Overview.
+  //
+  // A menu nobody just asked for (it comes when GitHub or a machine
+  // answers) lands while the person is pressing other keys: 1 2 3 for tabs,
+  // a second enter. So it's `noDigits` (digits don't choose: confirm menus
+  // are the same) and opens on its last item, the one that does nothing.
+  // Choosing anything else takes ↑/↓ and enter, pressed on purpose.
   showMenu(m, cx) {
     if (this.screen === "pr" && this.prTab !== "overview") {
       this.parked = m;
@@ -672,9 +678,9 @@ export default class GitHub extends View {
     this.menu = null;
     this.prTab = id;
     if (id === "overview" && this.parked) {
-      // The 1 that shows it is also its first item's key: a second press
-      // (or the key held) mustn't choose it unseen.
-      this.menu = { ...this.parked, shownAt: Date.now() };
+      // A parked menu is one nobody asked for, so it's `noDigits`: the 1
+      // that shows it, pressed again or held, chooses nothing.
+      this.menu = this.parked;
       this.parked = null;
       this.flash = "";
     }
@@ -704,7 +710,9 @@ export default class GitHub extends View {
         this.say(String(e?.message ?? e), cx, true);
       }
       this.busy = "";
-      if (ok && after) after(cx);
+      // What follows (a merge's cleanup) is about this PR: only while it's
+      // still the one shown, never another PR's or the list's.
+      if (ok && after && this.screen === "pr" && this.cur?.key === pr.key) after(pr, cx);
       this.loadDetail(cx);
       this.loadAll(cx);
       cx.notify();
@@ -726,19 +734,19 @@ export default class GitHub extends View {
     const items = d.merge.map((c) => ({
       label: c.label,
       run: (cx) => {
-        const go = (cx) => this.act({ do: c.do, method: c.method }, `${c.label}…`, cx, c.do === "merge" ? (cx) => this.cleanupMenu(cx) : null);
+        const go = (cx) => this.act({ do: c.do, method: c.method }, `${c.label}…`, cx, c.do === "merge" ? (pr, cx) => this.cleanupMenu(pr, cx) : null);
         if (!c.confirm) return go(cx);
-        this.showMenu({ title: c.confirm, items: [{ label: c.yes, run: go }, { label: "Cancel", run: () => {} }], at: 1, confirm: true }, cx);
+        this.showMenu({ title: c.confirm, items: [{ label: c.yes, run: go }, { label: "Cancel", run: () => {} }], at: 1, noDigits: true }, cx);
       },
     }));
     items.push({ label: "Cancel", run: () => {} });
     this.showMenu({ title: d.mergeTitle, items, at: 0 }, cx);
   }
 
-  // After a merge: delete its branch on GitHub, remove its worktree.
-  cleanupMenu(cx) {
+  // After a merge of `pr` (the PR shown): delete its branch on GitHub,
+  // remove its worktree.
+  cleanupMenu(pr, cx) {
     const d = this.detail;
-    const pr = this.cur;
     const tree = this.treeOf(pr);
     const canDelete = d?.cleanup?.deleteBranch;
     if (!d || (!canDelete && !tree)) return;
@@ -780,7 +788,7 @@ export default class GitHub extends View {
     if (canDelete) items.push({ label: `Delete the branch ${d.head} on GitHub`, run: clean(true, false) });
     if (tree) items.push({ label: "Remove the worktree (and close its space)", run: clean(false, true) });
     items.push({ label: "Leave everything", run: () => {} });
-    this.showMenu({ title: `Merged #${d.number}. Clean up?`, items, at: 0 }, cx);
+    this.showMenu({ title: `Merged #${d.number}. Clean up?`, items, at: items.length - 1, noDigits: true }, cx);
   }
 
   // ── worktrees ──────────────────────────────────────────────────────────
@@ -855,7 +863,8 @@ export default class GitHub extends View {
               { label: `Clone it into ${missing.dest}${missing.machine ? ` on ${missing.machine}` : ""}`, run: (cx) => this.worktree(cx, start, missing) },
               { label: "Cancel", run: () => {} },
             ],
-            at: 0,
+            at: 1,
+            noDigits: true,
           }, cx);
         }
         this.trees[pr.key] = { path: res.path, machine: where.machine };
@@ -961,14 +970,17 @@ export default class GitHub extends View {
 
   // ── keys ───────────────────────────────────────────────────────────────
 
-  menuKey(k, cx) {
+  // A menu's keys. A held key moves the choice but never makes it: its
+  // repeats come faster than anyone reads what they'd choose.
+  menuKey(k, cx, held = false) {
     const m = this.menu;
     const n = m.items.length;
+    const digit = /^[1-9]$/.test(k);
     if (k === "down") m.at = (m.at + 1) % n;
     else if (k === "up") m.at = (m.at + n - 1) % n;
+    else if (held && (k === "enter" || digit)) return true;
     else if (k === "enter") this.choose(m.items[m.at], cx);
-    else if (/^[1-9]$/.test(k) && m.shownAt && Date.now() - m.shownAt < 500) return true;
-    else if (!m.confirm && /^[1-9]$/.test(k) && Number(k) <= n) this.choose(m.items[Number(k) - 1], cx);
+    else if (!m.noDigits && digit && Number(k) <= n) this.choose(m.items[Number(k) - 1], cx);
     else return false;
     return true;
   }
@@ -979,12 +991,12 @@ export default class GitHub extends View {
     cx.notify();
   }
 
-  // One key, from on_key_down or a command (tab, shift-tab): whether it
-  // was this screen's.
-  press(k, cx) {
+  // One key, from on_key_down (`held` when it's a repeat) or a command
+  // (tab, shift-tab): whether it was this screen's.
+  press(k, cx, held = false) {
     if ((k === "tab" || k === "shift-tab") && !this.once(k)) return true;
-    if (this.screen === "pr" && this.cur) return this.prKey(k, cx);
-    if (this.menu) return this.menuKey(k, cx);
+    if (this.screen === "pr" && this.cur) return this.prKey(k, cx, held);
+    if (this.menu) return this.menuKey(k, cx, held);
     if (k === "tab" || k === "shift-tab") {
       this.step(k === "tab" ? 1 : -1, cx);
       return true;
@@ -995,11 +1007,11 @@ export default class GitHub extends View {
   // A key on the PR screen, by its tab (prkeys.js has the rules). The Files
   // tab's view has every key first; what it declines never reaches a menu
   // or the PR's actions.
-  prKey(k, cx) {
+  prKey(k, cx, held) {
     if (this.prTab === "files" && this.files?.key(k, cx)) return true;
     switch (prRoute(k, this.prTab, Boolean(this.menu))) {
       case "menu":
-        return this.menuKey(k, cx);
+        return this.menuKey(k, cx, held);
       case "tab":
         this.setPrTab(tabFor(k, this.prTab), cx);
         return true;
@@ -1503,7 +1515,7 @@ export default class GitHub extends View {
           .when(on, (el) => el.bg(tint(o.accent, 0.18)))
           .when(!on, (el) => el.hover((s) => s.bg(o.sunk)))
           .on_click((_e, cx) => this.choose(it, cx))
-          .when(!m.confirm, (el) => el.child(div().flex_none().w(14).font_family(MONO).text_size(11.5).text_color(o.dim).child(String(i + 1))))
+          .when(!m.noDigits, (el) => el.child(div().flex_none().w(14).font_family(MONO).text_size(11.5).text_color(o.dim).child(String(i + 1))))
           .child(div().text_size(13).when(on, (el) => el.font_medium()).text_color(on ? o.fg : o.muted).child(it.label));
       }));
   }
@@ -1582,7 +1594,7 @@ export default class GitHub extends View {
       .on_key_down((e, cx) => {
         const k = e.keystroke;
         if (k === "escape") this.escape(cx);
-        else if (!this.press(k, cx)) return;
+        else if (!this.press(k, cx, Boolean(e.is_held))) return;
         cx.stop_propagation();
         cx.notify();
       })
