@@ -178,7 +178,7 @@ func (d *demoSource) addDemoFiles(h func(float64) time.Time) {
 	onFile.Subject, onFile.OriginalLine = "file", 0
 
 	d.filesData["github.com/halcyon/notes-app#482"] = &demoPRFiles{
-		files: []demoFile{pkg, note, markers, legacy, proposal, engine, threeWay, tests, png},
+		files: []demoFile{pkg, note, markers, legacy, proposal, engine, threeWay, png, tests},
 		threads: []fileThread{
 			demoThread("PRRT_demo_1", engine.Filename, 142, false,
 				c("1", "jonas", "Should this timeout be shorter than the request's own? Otherwise we never see it fire.", 20, "submitted"),
