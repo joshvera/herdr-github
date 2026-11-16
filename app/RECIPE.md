@@ -123,6 +123,9 @@ Overview: `w` worktree, `s` start an agent, `m` merge, `d` draft ↔ ready, `a`
 agents, `l` its Linear issue (in herdr-linear's Linear mod). On Checks: ↑ ↓
 and Enter to open a check's run. On every tab: `o` open on GitHub, `y` copy
 the link, `r` reload. The keys that change a PR never act on Files changed.
+A menu that comes on its own (cleaning up after a merge, a missing checkout)
+opens on its do-nothing item and takes only ↑ ↓ and Enter, never `1`-`9`, and
+a held key never chooses in any menu.
 Every key is also a click along the bottom.
 `github.demo` (with `herdr-app do`, while it's open) switches to a made-up
 org for that opening.
