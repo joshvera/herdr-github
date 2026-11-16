@@ -40,6 +40,14 @@ type partialError struct {
 
 func (e *partialError) Error() string { return e.msg }
 
+// staleError: the PR's head isn't the commit the caller was looking at. Head
+// is the head GitHub has now, when it's known.
+type staleError struct{ Head string }
+
+func (e *staleError) Error() string {
+	return "the pull request has new commits: reload its files"
+}
+
 // errTruncated: a list stopped at the cap rather than page on without end.
 var errTruncated = errors.New("showing the first 200: filter, or open GitHub for the rest")
 
@@ -308,6 +316,16 @@ var endpointFn = func(host string) string {
 		return "https://api.github.com/graphql"
 	}
 	return "https://" + host + "/api/graphql"
+}
+
+// restEndpointFn is the REST base URL for a host; a seam for tests.
+var restEndpointFn = restBase
+
+func restBase(host string) string {
+	if host == "github.com" {
+		return "https://api.github.com"
+	}
+	return "https://" + host + "/api/v3"
 }
 
 type ghClient struct {
