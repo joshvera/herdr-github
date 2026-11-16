@@ -385,7 +385,7 @@ export default class GitHub extends View {
       if (!this.demo) await this.findGitHub();
       else this.login = "sam";
     } catch (e) {
-      this.err = `Not signed in to GitHub on any machine: ${e?.message ?? e}. Run gh auth login on one.`;
+      this.err = e instanceof DevError ? e.message : `Not signed in to GitHub on any machine: ${e?.message ?? e}. Run gh auth login on one.`;
       return cx.notify();
     }
     await this.findRepo();
@@ -672,7 +672,9 @@ export default class GitHub extends View {
     this.menu = null;
     this.prTab = id;
     if (id === "overview" && this.parked) {
-      this.menu = this.parked;
+      // The 1 that shows it is also its first item's key: a second press
+      // (or the key held) mustn't choose it unseen.
+      this.menu = { ...this.parked, shownAt: Date.now() };
       this.parked = null;
       this.flash = "";
     }
@@ -965,6 +967,7 @@ export default class GitHub extends View {
     if (k === "down") m.at = (m.at + 1) % n;
     else if (k === "up") m.at = (m.at + n - 1) % n;
     else if (k === "enter") this.choose(m.items[m.at], cx);
+    else if (/^[1-9]$/.test(k) && m.shownAt && Date.now() - m.shownAt < 500) return true;
     else if (!m.confirm && /^[1-9]$/.test(k) && Number(k) <= n) this.choose(m.items[Number(k) - 1], cx);
     else return false;
     return true;
