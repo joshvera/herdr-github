@@ -14,13 +14,11 @@ import (
 // file's diff as rows (see patch.go). Everything in an answer is from one
 // head commit, and the answer says which.
 
-// Limits: past any of them the answer says more: true.
+// Limits: past any of them the answer says more: true. Pages are 100 (files,
+// threads) and a thread's first 50 comments, as filesQuery asks.
 const (
-	maxFiles       = 3000 // REST's own cap too
-	maxThreads     = 300
-	maxThreadReply = 50 // comments fetched per thread
-	filesPageSize  = 100
-	threadsPage    = 100
+	maxFiles   = 3000 // REST's own cap too
+	maxThreads = 300
 )
 
 // ── what the mod gets ─────────────────────────────────────────────────────────
