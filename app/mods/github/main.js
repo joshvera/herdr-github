@@ -827,9 +827,8 @@ export default class GitHub extends View {
 
   // Opens the PR's worktree in a space, made if there's none; start: with an
   // agent in it, asked to look at the PR (only a new one: an existing one's
-  // agent may be busy).
-  worktree(cx, start, clone = null) {
-    const pr = this.cur;
+  // agent may be busy). `pr`: the PR it's for, the one shown when asked.
+  worktree(cx, start, clone = null, pr = this.cur) {
     if (!pr) return;
     this.busy = clone ? `Cloning ${pr.repo}…` : start ? "Starting…" : "Opening its worktree…";
     this.menu = null;
@@ -857,10 +856,13 @@ export default class GitHub extends View {
         }
         this.busy = "";
         if (!res) {
+          // A question about this PR: only while it's still the one shown,
+          // never on another PR's screen or the list (as a merge's cleanup).
+          if (this.screen !== "pr" || this.cur?.key !== pr.key) return;
           return this.showMenu({
             title: `No checkout of ${missing.repo} on any machine with spaces.`,
             items: [
-              { label: `Clone it into ${missing.dest}${missing.machine ? ` on ${missing.machine}` : ""}`, run: (cx) => this.worktree(cx, start, missing) },
+              { label: `Clone it into ${missing.dest}${missing.machine ? ` on ${missing.machine}` : ""}`, run: (cx) => this.worktree(cx, start, missing, pr) },
               { label: "Cancel", run: () => {} },
             ],
             at: 1,
@@ -971,13 +973,16 @@ export default class GitHub extends View {
   // ── keys ───────────────────────────────────────────────────────────────
 
   // A menu's keys. A held key moves the choice but never makes it: its
-  // repeats come faster than anyone reads what they'd choose.
+  // repeats come faster than anyone reads what they'd choose. A menu nobody
+  // asked for (`noDigits`) opens on the item that does nothing, at its end:
+  // its arrows stop there rather than wrap round to the first, which deletes.
   menuKey(k, cx, held = false) {
     const m = this.menu;
     const n = m.items.length;
     const digit = /^[1-9]$/.test(k);
-    if (k === "down") m.at = (m.at + 1) % n;
-    else if (k === "up") m.at = (m.at + n - 1) % n;
+    const move = (d) => (m.noDigits ? Math.max(0, Math.min(n - 1, m.at + d)) : (m.at + d + n) % n);
+    if (k === "down") m.at = move(1);
+    else if (k === "up") m.at = move(-1);
     else if (held && (k === "enter" || digit)) return true;
     else if (k === "enter") this.choose(m.items[m.at], cx);
     else if (!m.noDigits && digit && Number(k) <= n) this.choose(m.items[Number(k) - 1], cx);
