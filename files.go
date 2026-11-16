@@ -396,3 +396,78 @@ func (c *ghClient) files(ctx context.Context, r repoRef, number int) (filesAnswe
 	}
 	return filesFrom(g, rest), nil
 }
+
+// diffFrom is one file's diff, from the PR's REST files: its patch parsed
+// into rows (see parsePatch), or the state that says why there are none.
+func diffFrom(files []restFile, head, path string) (diffAnswer, error) {
+	for _, f := range files {
+		if clean(f.Filename, false) != path {
+			continue
+		}
+		a := diffAnswer{Head: head, Path: path, State: diffOK, Rows: []diffRow{}}
+		if f.Patch == "" {
+			a.State = noPatchState(f)
+			return a, nil
+		}
+		rows, large := parsePatch(f.Patch)
+		switch {
+		case large:
+			a.State = diffLarge
+		case len(rows) == 0:
+			a.State = diffEmpty
+		default:
+			a.Rows = rows
+		}
+		return a, nil
+	}
+	return diffAnswer{}, fmt.Errorf("%q isn't one of this pull request's changed files", path)
+}
+
+// diff answers the `diff` op for a head the cache doesn't have (the app
+// answers from the cache before it gets here). It reads the PR's head, then
+// the files (guarded by restFilesAt, which keeps them under the head it
+// found), and answers stale if that isn't the head asked for: the files are
+// still kept, so the `files` the mod then asks for is free.
+func (c *ghClient) diff(ctx context.Context, r repoRef, number int, head, path string) (diffAnswer, error) {
+	before := time.Now()
+	_, found, err := c.prHead(ctx, r, number)
+	if err != nil {
+		return diffAnswer{}, err
+	}
+	stale := func(now string) diffAnswer {
+		return diffAnswer{Head: now, Path: path, State: diffStale, Rows: []diffRow{}}
+	}
+	files, err := c.restFilesAt(ctx, r, number, found, before)
+	var st *staleError
+	switch {
+	case errors.As(err, &st):
+		return stale(st.Head), nil
+	case found != head:
+		return stale(found), nil
+	case err != nil:
+		return diffAnswer{}, err
+	}
+	return diffFrom(files, head, path)
+}
+
+// setViewed marks a file viewed or not. The mutation takes only the PR's ID
+// and the path, so the head is compared here first, and nothing is marked if
+// it moved. A push can still land between the check and the mutation (GitHub
+// offers no way to pin it); the worst case is a mark on a file that changed,
+// which GitHub shows as dismissed.
+func (c *ghClient) setViewed(ctx context.Context, r repoRef, number int, head, path string, viewed bool) error {
+	id, current, err := c.prHead(ctx, r, number)
+	if err != nil {
+		return err
+	}
+	if current != head {
+		return &staleError{Head: current}
+	}
+	mutation := "unmarkFileAsViewed"
+	if viewed {
+		mutation = "markFileAsViewed"
+	}
+	return c.graphql(ctx, `mutation($id: ID!, $path: String!) {
+  `+mutation+`(input: {pullRequestId: $id, path: $path}) { clientMutationId }
+}`, map[string]any{"id": id, "path": path}, nil)
+}

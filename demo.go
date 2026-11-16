@@ -26,6 +26,10 @@ type demoSource struct {
 	prs     []*prDetail
 	trees   map[string]bool
 	methods map[string]string
+	// The files and review threads of a few PRs, by key, and which files are
+	// viewed (key → path → viewed, unviewed, dismissed): see demo_files.go.
+	filesData map[string]*demoPRFiles
+	viewed    map[string]map[string]string
 }
 
 func newDemoSource() *demoSource {
@@ -34,6 +38,7 @@ func newDemoSource() *demoSource {
 	d := &demoSource{
 		home: repoRef{Host: "github.com", Owner: "halcyon", Name: "notes-app"},
 		me:   "sam", trees: map[string]bool{}, methods: map[string]string{},
+		filesData: map[string]*demoPRFiles{}, viewed: map[string]map[string]string{},
 	}
 	settings := repoSettings{SquashMergeAllowed: true, MergeCommitAllowed: true, AutoMergeAllowed: true, ViewerDefaultMergeMethod: "SQUASH", ViewerPermission: "WRITE"}
 	pass := func(names ...string) []check {
@@ -50,7 +55,7 @@ func newDemoSource() *demoSource {
 		p.State = "OPEN"
 		p.RepoSettings = settings
 		p.ViewerCanMerge = true
-		p.HeadRefOid = "0000000"
+		p.HeadRefOid = demoHead(p.Number)
 		p.HeadRef = &struct {
 			ID string `json:"id"`
 		}{ID: "REF_" + p.HeadRefName}
@@ -177,6 +182,7 @@ func newDemoSource() *demoSource {
 	p.Additions, p.Deletions, p.ChangedFiles = 430, 12, 11
 	p.Body = "Work in progress."
 	add(p)
+	d.addDemoFiles(h)
 	return d
 }
 
