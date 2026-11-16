@@ -116,9 +116,13 @@ branches, numbers and keys.
 
 `cmd-g` opens it; `escape` leaves a menu, then a PR's screen (back to the
 list, or to Recap if Recap opened it), then the popup. In the list: type to
-filter, ← → for the tabs, ↑ ↓ and Enter. On a PR: `w` worktree, `s` start an
-agent, `m` merge, `d` draft ↔ ready, `a` agents, `o` open on GitHub, `y`
-copy the link, `l` its Linear issue (in herdr-linear's Linear mod), `r`
-reload. Every key is also a click along the bottom.
+filter, ← → for the tabs, ↑ ↓ and Enter. On a PR, three tabs: `1` Overview,
+`2` Checks, `3` Files changed, and `tab` / `shift-tab` cycle them
+(`keys.json` binds both to the mod, since the app keeps them otherwise). On
+Overview: `w` worktree, `s` start an agent, `m` merge, `d` draft ↔ ready, `a`
+agents, `l` its Linear issue (in herdr-linear's Linear mod). On Checks: ↑ ↓
+and Enter to open a check's run. On every tab: `o` open on GitHub, `y` copy
+the link, `r` reload. The keys that change a PR never act on Files changed.
+Every key is also a click along the bottom.
 `github.demo` (with `herdr-app do`, while it's open) switches to a made-up
 org for that opening.
