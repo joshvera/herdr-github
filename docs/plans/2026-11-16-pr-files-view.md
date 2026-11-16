@@ -30,9 +30,13 @@ then orders the work.
   `cmd-alt-[`, `cmd-/`, so bare keys are spelled `]`, `[`, `/`; nothing
   binds them bare globally. One installed mod already matches
   `shift-tab`. Still to confirm in the running app.
-- Pending threads: the owner has no pending review with comments to read
-  (one on get-starlight/fusion-core#750 has none). Checking needs a GitHub
-  write (a pending comment); asked of the owner, not done.
+- Pending threads: `reviewThreads` does return the viewer's own pending
+  threads. Checked on a pending line comment the owner left on
+  get-starlight/fusion-core#750: comment `state: PENDING`, `line: 2`,
+  `diffSide: RIGHT`, `subjectType: LINE`. The built binary's `files` op
+  carried it as `"state":"pending"` (1.8 s), and the follow-up `diff`
+  answered from the cache in 14 ms with no request; the thread's `right`
+  line 2 matches the added row `new: 2`.
 
 ## Decisions on gaps in the spec
 
@@ -123,7 +127,7 @@ Steps, each one commit:
 
 ## Verification left to a real PR
 
-- Whether `reviewThreads` returns the viewer's pending threads.
+- ~~Whether `reviewThreads` returns the viewer's pending threads.~~ Yes (above).
 - The no-patch rule on a binary file and a pure rename.
 - Keystroke names for `]`, `[`, `/`, `shift-tab`.
 
