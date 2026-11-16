@@ -150,3 +150,18 @@ func TestBodyKeepsLineBreaksButNotEscapes(t *testing.T) {
 		t.Fatalf("%q / %q / %q", d.Body, d.Title, d.Comments[0].Body)
 	}
 }
+
+// A review thread's diff hunk is lines of a diff: it keeps its breaks, while
+// the field next to it (a path) is flattened, and both lose escapes.
+func TestSanitizeKeepsADiffHunksLineBreaks(t *testing.T) {
+	type node struct {
+		Path     string `json:"path"`
+		DiffHunk string
+		Body     string
+	}
+	n := node{Path: "a\nb\x1b[31m.rb", DiffHunk: "@@ -1 +1 @@\n-a\t1\x1b]52;c;AAAA\x07\n+b\r\n", Body: "x\ny"}
+	sanitize(&n)
+	if n.Path != "a b.rb" || n.DiffHunk != "@@ -1 +1 @@\n-a\t1\n+b\n" || n.Body != "x\ny" {
+		t.Fatalf("%+v", n)
+	}
+}

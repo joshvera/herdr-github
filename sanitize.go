@@ -10,9 +10,10 @@ import (
 // terminal or fakes screen content. So every string from the API is cleaned
 // once, at decode time, before any of it can reach the screen.
 
-// multiline names the fields that are prose (Markdown bodies): they keep their line
-// breaks and tabs. Every other string is a one-line label.
-var multiline = map[string]bool{"Body": true}
+// multiline names the fields that are prose (Markdown bodies) or a diff hunk
+// (a review thread's): they keep their line breaks and tabs. Every other
+// string is a one-line label.
+var multiline = map[string]bool{"Body": true, "DiffHunk": true}
 
 // clean removes escape sequences and control characters. keepBreaks keeps
 // newlines and tabs (for prose); otherwise they become spaces.
