@@ -6,7 +6,8 @@
 //
 // The work is herdr-github's (`app`), the TUI plugin's own code, run on the
 // machine where gh is signed in. The mod fetches the herdr-github release it
-// needs onto each machine it asks, the first time.
+// needs onto each machine it asks, the first time (on this computer, a local
+// build in its place when dev.json names one).
 
 import { View, div } from "gpui-kit";
 import * as fs from "fs/promises";
@@ -43,14 +44,43 @@ mkdir -p "$dest" && mv "$tmp/herdr-github" "$bin.new" && chmod 755 "$bin.new" &&
 printf '%s' "$bin"
 `;
 
+// A herdr-github built on this computer, to run in place of the release:
+// `mods/github/dev.json` in the app's home, `{"bin": "/absolute/path"}`. Only
+// for requests on this computer; other machines fetch the release as ever.
+// Kept out of the repo (.gitignore), so it's never shipped.
+const DEV = `${appHome()}/mods/github/dev.json`;
+
+// A dev.json that's there but wrong: said as it is, never worked around by
+// asking another machine instead.
+class DevError extends Error {}
+
+async function devBinary() {
+  const text = await fs.readFile(DEV, "utf8").catch(() => null);
+  if (text === null) return null;
+  let bin;
+  try {
+    bin = JSON.parse(text)?.bin;
+  } catch {
+    throw new DevError(`${DEV} isn't JSON`);
+  }
+  if (typeof bin !== "string" || !bin.startsWith("/")) throw new DevError(`${DEV} needs {"bin": "/absolute/path"}`);
+  const r = await exec("test", ["-x", bin]);
+  if (r.code !== 0) throw new DevError(`${DEV} names ${bin}, which isn't an executable file`);
+  return bin;
+}
+
+function provision(machine) {
+  return exec("sh", ["-c", PROVISION, "sh", GITHUB_VERSION], { on: machine }).then((r) => {
+    if (r.code !== 0 || !r.stdout.trim()) throw new Error(r.stderr.trim().split("\n").pop() || `herdr-github: exit ${r.code}`);
+    return r.stdout.trim();
+  });
+}
+
 const binaries = new Map();
 function binary(machine) {
   const k = machine ?? "";
   if (!binaries.has(k)) {
-    const p = exec("sh", ["-c", PROVISION, "sh", GITHUB_VERSION], { on: machine }).then((r) => {
-      if (r.code !== 0 || !r.stdout.trim()) throw new Error(r.stderr.trim().split("\n").pop() || `herdr-github: exit ${r.code}`);
-      return r.stdout.trim();
-    });
+    const p = (machine == null ? devBinary() : Promise.resolve(null)).then((dev) => dev ?? provision(machine));
     p.catch(() => binaries.delete(k));
     binaries.set(k, p);
   }
@@ -63,13 +93,33 @@ class AppError extends Error {
     super(res.error);
     this.signedOut = res.signedOut ?? null;
     this.noCheckout = res.noCheckout ?? null;
+    // The PR's head moved past the one the request named: read it again.
+    this.stale = Boolean(res.stale);
   }
 }
 
-// One request to herdr-github on a machine (null: this one).
-async function ask(req, machine) {
+// A request that ran out of time: the machine answered, slowly. Shown as it
+// is; asking another machine wouldn't make it faster.
+class TimedOut extends Error {}
+
+// exec's own limit when none is given.
+const EXEC_TIMEOUT = 30000;
+
+// One request to herdr-github on a machine (null: this one). `opts` go to
+// exec (a longer `timeout`, in ms).
+async function ask(req, machine, opts = {}) {
   const bin = await binary(machine);
-  const r = await exec("sh", ["-c", 'exec "$0" app "$1"', bin, JSON.stringify(req)], { on: machine });
+  const limit = opts.timeout ?? EXEC_TIMEOUT;
+  const started = Date.now();
+  let r;
+  try {
+    r = await exec("sh", ["-c", 'exec "$0" app "$1"', bin, JSON.stringify(req)], { ...opts, on: machine });
+  } catch (e) {
+    // exec rejects the same way for a timeout and an unreachable machine;
+    // only the time it took tells them apart.
+    if (Date.now() - started >= limit - 250) throw new TimedOut(`herdr-github didn't answer within ${Math.round(limit / 1000)}s`);
+    throw e;
+  }
   let res;
   try {
     res = JSON.parse(r.stdout);
@@ -249,6 +299,7 @@ export default class GitHub extends View {
         localStorage.setItem("on", m);
         return m || null;
       } catch (e) {
+        if (e instanceof DevError) throw e;
         last = e;
       }
     }
@@ -256,16 +307,17 @@ export default class GitHub extends View {
     throw last ?? new Error("no machine answered");
   }
 
-  async gh(req) {
-    if (this.demo) return ask({ ...req, demo: true }, null);
+  // One request where gh is signed in; `opts` go to exec (see ask).
+  async gh(req, opts = {}) {
+    if (this.demo) return ask({ ...req, demo: true }, null, opts);
     if (this.on == null || !this.login) await this.findGitHub();
     try {
-      return await ask(req, this.on || null);
+      return await ask(req, this.on || null, opts);
     } catch (e) {
-      if (e instanceof AppError) throw e;
+      if (e instanceof AppError || e instanceof TimedOut || e instanceof DevError) throw e;
       // The machine went away, or herdr-github couldn't be fetched there: look again.
       await this.findGitHub();
-      return ask(req, this.on || null);
+      return ask(req, this.on || null, opts);
     }
   }
 

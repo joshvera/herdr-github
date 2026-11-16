@@ -8,3 +8,8 @@
 /herdr-github
 # Claude Code session files.
 /.claude/
+# Written into a mod folder by `herdr-app check`.
+/app/mods/github/gpui-kit.d.ts
+/app/mods/github/jsconfig.json
+# A local herdr-github build for the mod to run (see main.js); never shipped.
+/app/mods/github/dev.json

@@ -64,6 +64,13 @@ longer while herdr-github is fetched; afterwards it's in
 machine that isn't signed in is skipped; with none signed in, the popup
 says so.
 
+**Working on herdr-github itself?** Put `dev.json` in the installed mod's
+folder (`~/.config/herdr-app/mods/github/dev.json`) with
+`{"bin": "/absolute/path/to/herdr-github"}`: requests on this computer then
+run that build instead of the release. Other machines still fetch the
+release. It's never part of the repo's copy, so reinstalling over the mod
+folder keeps it unless the folder is deleted first.
+
 ## What it does, and asks
 
 - Runs `herdr-github app` (one JSON request in, one answer out) through
