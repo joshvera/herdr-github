@@ -78,8 +78,8 @@ export class FilesView {
     this.error = "";
     this.data = null; // `files`'s answer: head, files, threads, more
     this.byPath = new Map(); // a file's threads
-    this.gen = 0; // which `files` load is the latest
-    this.reading = false; // a `files` load is out
+    this.reading = false; // the one `files` load out
+    this.again = null; // asked for while one was out: { note }, once it answers
     this.diffs = new Map(); // path → `diff`'s answer, for data.head
     this.failed = new Map(); // path → why its diff didn't come, until r
     this.asking = null; // the one diff request out
@@ -91,7 +91,8 @@ export class FilesView {
     this.foldN = 0;
     this.query = "";
     this.typing = false; // the filter has the keyboard
-    this.leftAt = 0;
+    this.leftAt = 0; // when it last left the filter
+    this.blurAt = 0; // when the filter lost focus while typing (see filterFocus)
     this.saving = new Set(); // paths whose viewed mark is being saved
     this.width = Math.max(320, app.width - 32 - TREE_W - 12);
     this.treeMemo = { data: null, query: "", rows: [], order: [] };
@@ -103,7 +104,9 @@ export class FilesView {
     ui.treeScroll.scroll_to_item(0);
   }
 
-  // Whether it's still the tab's view (a PR opened since replaces it).
+  // Whether it's still the tab's view (a PR opened since replaces it). An
+  // answer for a view that isn't touches nothing: not its state, not the
+  // lists' handles (they're the new view's now), and it asks nothing more.
   alive() {
     return this.app.files === this;
   }
@@ -184,10 +187,11 @@ export class FilesView {
   // Asked again when a list's items land: a request made while the list
   // wasn't drawn (its diff still coming) may not have been kept.
   follow() {
-    this.ui.diffScroll.scroll_to_item(this.at);
+    if (this.alive()) this.ui.diffScroll.scroll_to_item(this.at);
   }
 
   followTree() {
+    if (!this.alive()) return;
     const i = this.tree().rows.findIndex((r) => r.file?.path === this.path);
     if (i >= 0) this.ui.treeScroll.scroll_to_item(i);
   }
@@ -209,8 +213,15 @@ export class FilesView {
     this.loadFiles(cx);
   }
 
+  // One `files` at a time: it's every REST page of the PR. Asked again
+  // while one is out (r, a stale answer), it's read once more when that one
+  // answers, however many times it was asked.
   loadFiles(cx, note = "") {
-    const gen = ++this.gen;
+    if (!this.alive()) return;
+    if (this.reading) {
+      this.again = { note: note || this.again?.note || "" };
+      return;
+    }
     this.reading = true;
     if (!this.data) this.state = "loading";
     cx.notify();
@@ -219,9 +230,12 @@ export class FilesView {
       try {
         res = await this.app.gh({ op: "files", pr: this.prID() }, SLOW);
       } catch (e) {
-        if (gen !== this.gen) return;
+        if (!this.alive()) return;
         this.reading = false;
+        const again = this.again;
+        this.again = null;
         if (TOO_OLD.test(said(e))) this.state = "old";
+        else if (again) this.loadFiles(cx, again.note);
         else if (this.data) {
           // What was there stays, and the open diff r let go comes again.
           this.say(said(e), cx, true);
@@ -232,7 +246,7 @@ export class FilesView {
         }
         return cx.notify();
       }
-      if (gen !== this.gen) return;
+      if (!this.alive()) return;
       this.reading = false;
       if (this.data?.head !== res.head) {
         this.diffs.clear();
@@ -249,6 +263,10 @@ export class FilesView {
       }
       this.followTree();
       if (note) this.say(note, cx);
+      // What was asked for meanwhile goes now; its diffs wait for it (pump).
+      const again = this.again;
+      this.again = null;
+      if (again) this.loadFiles(cx, again.note);
       this.pump(cx);
       cx.notify();
     });
@@ -276,7 +294,7 @@ export class FilesView {
       } catch (e) {
         err = e;
       }
-      if (this.asking !== req) return; // a new head took its place
+      if (!this.alive() || this.asking !== req) return; // a new PR or head took its place
       this.asking = null;
       if (this.data?.head !== head) return this.pump(cx);
       if (err && TOO_OLD.test(said(err))) this.state = "old";
@@ -367,11 +385,17 @@ export class FilesView {
   // esc on this tab: true when it was the filter's (esc clears it, and
   // leaves it). One press, whichever way it comes, leaves only the filter.
   escape(cx) {
-    if (this.typing) {
+    if (this.typing || this.blurredNow()) {
       this.leaveFilter(true, cx);
       return true;
     }
     return Date.now() - this.leftAt < SAME_PRESS_MS;
+  }
+
+  // The filter lost focus on its own this press: the Input letting go of an
+  // esc before the key comes here. That esc is still the filter's.
+  blurredNow() {
+    return Date.now() - this.blurAt < SAME_PRESS_MS;
   }
 
   startFilter(cx) {
@@ -382,8 +406,9 @@ export class FilesView {
 
   // Leaves the filter, keeping what it says (enter) or clearing it (esc).
   leaveFilter(clear, cx) {
-    if (!this.typing) return;
+    if (!this.typing && !this.blurredNow()) return;
     this.typing = false;
+    this.blurAt = 0;
     this.leftAt = Date.now();
     if (clear && this.query) {
       this.query = "";
@@ -402,6 +427,8 @@ export class FilesView {
   }
 
   filterFocus(on, cx) {
+    // leaveFilter's own blur comes when it isn't typing any more.
+    if (!on && this.typing) this.blurAt = Date.now();
     this.typing = on;
     cx.notify();
   }
@@ -499,17 +526,23 @@ export class FilesView {
     f.viewed = to;
     this.saving.add(f.path);
     cx.spawn(async (cx) => {
+      let err = null;
       try {
         await this.app.gh({ op: "act", do: to, pr: this.prID(), path: f.path, head });
+      } catch (e) {
+        err = e;
+      }
+      this.saving.delete(f.path);
+      if (!this.alive()) return;
+      if (!err) {
         // The files read again meanwhile, for the same head: theirs too.
         const now = this.data?.head === head ? this.file(f.path) : null;
         if (now) now.viewed = to;
-      } catch (e) {
+      } else {
         if (f.viewed === to) f.viewed = was;
-        if (isStale(e)) this.loadFiles(cx, `The PR has new commits, so ${f.path} wasn't marked: its files are read again.`);
-        else this.say(said(e), cx, true);
+        if (isStale(err)) this.loadFiles(cx, `The PR has new commits, so ${f.path} wasn't marked: its files are read again.`);
+        else this.say(said(err), cx, true);
       }
-      this.saving.delete(f.path);
       cx.notify();
     });
     if (to === "viewed") this.nextUnviewed(cx);
