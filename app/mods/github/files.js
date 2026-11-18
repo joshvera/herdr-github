@@ -56,8 +56,6 @@ const lastIndex = (xs, ok) => {
   for (let i = xs.length - 1; i >= 0; i--) if (ok(xs[i], i)) return i;
   return -1;
 };
-// herdr-github's answer that the PR's head moved past the one named (main's AppError).
-const isStale = (e) => e instanceof Error && "stale" in e && e.stale === true;
 const isWeb = (url) => typeof url === "string" && /^https:\/\//.test(url);
 
 // A file's diff on GitHub: the PR's files page, at that file.
@@ -526,22 +524,18 @@ export class FilesView {
     f.viewed = to;
     this.saving.add(f.path);
     cx.spawn(async (cx) => {
-      let err = null;
-      try {
-        await this.app.gh({ op: "act", do: to, pr: this.prID(), path: f.path, head });
-      } catch (e) {
-        err = e;
-      }
+      const r = await this.app.mutate({ op: "act", do: to, pr: this.prID(), path: f.path, head });
       this.saving.delete(f.path);
       if (!this.alive()) return;
-      if (!err) {
+      if (r.kind === "ok") {
         // The files read again meanwhile, for the same head: theirs too.
         const now = this.data?.head === head ? this.file(f.path) : null;
         if (now) now.viewed = to;
       } else {
         if (f.viewed === to) f.viewed = was;
-        if (isStale(err)) this.loadFiles(cx, `The PR has new commits, so ${f.path} wasn't marked: its files are read again.`);
-        else this.say(said(err), cx, true);
+        if (r.kind === "unknown") this.say(`No answer about ${f.path}. r shows whether it was marked.`, cx, true);
+        else if (r.answer?.stale === true) this.loadFiles(cx, `The PR has new commits, so ${f.path} wasn't marked: its files are read again.`);
+        else this.say(r.error, cx, true);
       }
       cx.notify();
     });

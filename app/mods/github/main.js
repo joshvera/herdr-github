@@ -17,6 +17,7 @@ import { demoAgents, DEMO_REPO } from "./demo.js";
 import { tones, tint, countPill, groupOf, toneColor, prLook, checkLook, ago, icon, chip, words, key, cap, MONO } from "./look.js";
 import { PR_TABS, tabFor, prRoute } from "./prkeys.js";
 import { FilesView } from "./files.js";
+import { sendOnce, MutationGate, MUTATION_TIMEOUT } from "./mutation.js";
 
 // The herdr-github this mod is part of (its release; the repo's tests hold it
 // to herdr-plugin.toml's version).
@@ -228,6 +229,7 @@ export default class GitHub extends View {
     this.err = "";
     this.busy = "";
     this.acting = new Set(); // the PRs (keys) a change was sent for, until GitHub answers
+    this.gate = new MutationGate(); // changes out, against which polls are ordered
     this.repo = null;
     this.picking = false; // the repo tab's list of repos
     this.repos = null;
@@ -347,6 +349,31 @@ export default class GitHub extends View {
       // The machine went away, or herdr-github couldn't be fetched there: look again.
       await this.findGitHub();
       return ask(req, this.on || null, opts);
+    }
+  }
+
+  // A change to GitHub, sent once (mutation.js): never asked again, here or
+  // on another machine. The machine is looked for first, only when none is
+  // chosen yet. Polls wait on this.gate while one is out.
+  /** @returns {Promise<import("./mutation.js").Outcome>} */
+  async mutate(req) {
+    if (!this.demo && (this.on == null || !this.login)) {
+      try {
+        await this.findGitHub();
+      } catch (e) {
+        return { kind: "refused", error: `Nothing was sent: ${e?.message ?? e}`, answer: null };
+      }
+    }
+    const machine = this.demo ? null : this.on || null;
+    const body = JSON.stringify(this.demo ? { ...req, demo: true } : req);
+    this.gate.begin();
+    try {
+      return await sendOnce({
+        prepare: () => binary(machine),
+        run: (bin) => exec("sh", ["-c", 'exec "$0" app "$1"', bin, body], { timeout: MUTATION_TIMEOUT, on: machine }),
+      });
+    } finally {
+      this.gate.end();
     }
   }
 
@@ -676,14 +703,11 @@ export default class GitHub extends View {
     this.menu = null;
     cx.notify();
     cx.spawn(async (cx) => {
-      let ok = false;
-      try {
-        const res = await this.gh({ op: "act", ...what, pr: prID(pr) });
-        this.say(res.note ?? "Done", cx);
-        ok = true;
-      } catch (e) {
-        this.say(String(e?.message ?? e), cx, true);
-      }
+      const r = await this.mutate({ op: "act", ...what, pr: prID(pr) });
+      const ok = r.kind === "ok";
+      if (ok) this.say(r.answer.note ?? "Done", cx);
+      else if (r.kind === "refused") this.say(r.error, cx, true);
+      else this.say("No answer. Check the PR before trying again.", cx, true);
       this.acting.delete(pr.key);
       this.busy = "";
       // What follows (a merge's cleanup) is about this PR: only while it's
@@ -733,12 +757,10 @@ export default class GitHub extends View {
         const done = [];
         const failed = [];
         if (branch) {
-          try {
-            await this.gh({ op: "act", do: "delete-branch", pr: prID(pr) });
-            done.push("branch deleted");
-          } catch (e) {
-            failed.push(`branch not deleted: ${e?.message ?? e}`);
-          }
+          const r = await this.mutate({ op: "act", do: "delete-branch", pr: prID(pr) });
+          if (r.kind === "ok") done.push("branch deleted");
+          else if (r.kind === "refused") failed.push(`branch not deleted: ${r.error}`);
+          else failed.push("no answer about the branch: check the PR before trying again");
         }
         if (wt) {
           try {
