@@ -74,13 +74,11 @@ func isUnknown(err error) bool {
 // withReview adds the pending review to an act's error answer, keeping
 // whether it's unknown.
 func withReview(err error, review *reviewInfo) error {
-	a := &actError{err: err}
+	a := &actError{err: err, review: review, hasReview: true}
 	var inner *actError
 	if errors.As(err, &inner) {
-		c := *inner
-		a = &c
+		a.unknown, a.changed = inner.unknown, inner.changed
 	}
-	a.review, a.hasReview = review, true
 	return a
 }
 

@@ -52,6 +52,8 @@ type source interface {
 	// setViewed fails with a *staleError, without marking anything, when the
 	// PR's head isn't head.
 	setViewed(ctx context.Context, r repoRef, number int, head, path string, viewed bool) error
+	// reviewSource is the review actions on the Files changed tab (review.go).
+	reviewSource
 	// repos pages through the repos you can reach, for the repo list:
 	// the first page with cursor "", then each page's next until it's "".
 	repos(ctx context.Context, cursor string) ([]repoInfo, string, error)

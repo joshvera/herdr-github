@@ -37,16 +37,31 @@ type appRequest struct {
 	Repo   string `json:"repo,omitempty"`   // list's repo tab: host/owner/name
 	Cursor string `json:"cursor,omitempty"` // list, repos: where to go on from
 	PR     *prID  `json:"pr,omitempty"`
-	Do     string `json:"do,omitempty"`     // act: draft, ready, merge, auto, auto-off, enqueue, dequeue, delete-branch
+	// act: draft, ready, merge, auto, auto-off, enqueue, dequeue, delete-branch,
+	// viewed, unviewed; and the review actions (review.go): comment, reply,
+	// resolve, unresolve, edit, delete, submit, discard.
+	Do     string `json:"do,omitempty"`
 	Method string `json:"method,omitempty"` // act merge, auto: MERGE, SQUASH, REBASE
 	// worktree: folders to look in for a checkout of the PR's repo (the
 	// machine's spaces), and whether to clone it when there's none.
 	Dirs  []string `json:"dirs,omitempty"`
 	Clone bool     `json:"clone,omitempty"`
-	Path  string   `json:"path,omitempty"` // unworktree: the worktree to remove; diff, act viewed: the file
-	Head  string   `json:"head,omitempty"` // diff, act viewed: the PR's head commit the mod was shown
-	BG    bool     `json:"bg,omitempty"`   // run it as a job
-	Job   string   `json:"job,omitempty"`  // job: which; on a job's own run, where its answer goes
+	Path  string   `json:"path,omitempty"` // unworktree: the worktree to remove; diff, act viewed, comment: the file
+	Head  string   `json:"head,omitempty"` // diff, act viewed, comment: the PR's head commit the mod was shown
+	// The review actions: a comment's line and side (left or right), the
+	// text as typed, the thread or comment acted on, and for submit and
+	// discard the pending review and its comment count as the dialog showed
+	// them, and the event (comment, approve, request_changes).
+	Line     int    `json:"line,omitempty"`
+	Side     string `json:"side,omitempty"`
+	Body     string `json:"body,omitempty"`
+	Thread   string `json:"thread,omitempty"`
+	Comment  string `json:"comment,omitempty"`
+	ReviewID string `json:"reviewId,omitempty"`
+	Event    string `json:"event,omitempty"`
+	Count    *int   `json:"count,omitempty"`
+	BG       bool   `json:"bg,omitempty"`  // run it as a job
+	Job      string `json:"job,omitempty"` // job: which; on a job's own run, where its answer goes
 }
 
 // prID names a pull request: host, owner/name and number.
@@ -366,6 +381,17 @@ func appAnswer(ctx context.Context, cfg config, req appRequest) (any, error) {
 	if out, ok, err := appFilesOp(ctx, src, demo, req, r); ok {
 		return out, err
 	}
+	// The review actions too: each reads what it needs itself. The demo's
+	// state is saved whatever the outcome, since an unknown one may have
+	// changed it.
+	if out, ok, err := appReviewOp(ctx, src, req, r); ok {
+		if demo != nil {
+			if serr := demo.save(); serr != nil && err == nil {
+				return nil, serr
+			}
+		}
+		return out, err
+	}
 	pr, err := src.byNumber(ctx, r, req.PR.Number)
 	if err != nil {
 		return nil, err
@@ -413,6 +439,9 @@ func appFilesOp(ctx context.Context, src source, demo *appDemo, req appRequest, 
 		return out, true, err
 	case req.Op == "threads":
 		out, err := src.threads(ctx, r, n)
+		if err == nil && demo != nil {
+			err = demo.save() // the demo's pending review grows as it's polled
+		}
 		return out, true, err
 	case req.Op == "diff":
 		if err := checkHeadAndPath(req); err != nil {
@@ -726,6 +755,8 @@ type demoChange struct {
 	Tree  bool        `json:"tree"`
 	// Which files of the PR are viewed, by path; absent in older saves.
 	Viewed map[string]string `json:"viewed,omitempty"`
+	// Its review threads and the viewer's pending review; absent in older saves.
+	Review *demoReviewSave `json:"review,omitempty"`
 }
 
 func appDemoPath() string { return filepath.Join(stateDir(), "app-demo.json") }
@@ -755,6 +786,9 @@ func loadAppDemo() *appDemo {
 				d.src.viewed[p.key()][path] = state
 			}
 		}
+		if data := d.src.filesData[p.key()]; data != nil && c.Review != nil {
+			data.loadReview(c.Review)
+		}
 	}
 	return d
 }
@@ -765,6 +799,9 @@ func (d *appDemo) save() error {
 		c := demoChange{Draft: p.IsDraft, State: p.State, Merge: p.MergeStateStatus, Queue: p.MergeQueueEntry, Tree: d.src.trees[p.key()], Viewed: d.src.viewed[p.key()]}
 		if p.AutoMergeRequest != nil {
 			c.Auto = p.AutoMergeRequest.MergeMethod
+		}
+		if data := d.src.filesData[p.key()]; data != nil {
+			c.Review = data.saveReview()
 		}
 		saved[p.key()] = c
 	}
