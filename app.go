@@ -382,10 +382,10 @@ func appAnswer(ctx context.Context, cfg config, req appRequest) (any, error) {
 		return out, err
 	}
 	// The review actions too: each reads what it needs itself. The demo's
-	// state is saved whatever the outcome, since an unknown one may have
-	// changed it.
+	// state is saved when the action changed it, whatever the outcome (an
+	// unknown one may have; a reply's first step may have).
 	if out, ok, err := appReviewOp(ctx, src, req, r); ok {
-		if demo != nil {
+		if demo != nil && demo.src.changed {
 			if serr := demo.save(); serr != nil && err == nil {
 				return nil, serr
 			}
@@ -439,7 +439,7 @@ func appFilesOp(ctx context.Context, src source, demo *appDemo, req appRequest, 
 		return out, true, err
 	case req.Op == "threads":
 		out, err := src.threads(ctx, r, n)
-		if err == nil && demo != nil {
+		if err == nil && demo != nil && demo.src.changed {
 			err = demo.save() // the demo's pending review grows as it's polled
 		}
 		return out, true, err

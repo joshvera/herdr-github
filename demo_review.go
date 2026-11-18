@@ -163,6 +163,7 @@ func (d *demoSource) addDemoThread(p *prDetail, data *demoPRFiles, t newThread) 
 		OriginalLine: t.Line, Comments: []threadComment{c},
 	}
 	data.threads = append(data.threads, th)
+	d.changed = true
 	return th
 }
 
@@ -247,6 +248,7 @@ func (d *demoSource) startReview(_ context.Context, r repoRef, number int, _, co
 		return nil, nil, outcome
 	}
 	data.review = &demoReview{ID: data.newID("PRR", number), Commit: commit}
+	d.changed = true
 	if t == nil {
 		return data.pendingInfo(), nil, outcome
 	}
@@ -276,6 +278,7 @@ func (d *demoSource) addReply(_ context.Context, r repoRef, number int, reviewID
 	id := data.newID("PRRC", number)
 	c := threadComment{ID: id, Author: d.me, Body: body, Created: nowFn().UnixMilli(), State: "pending", URL: p.URL + "#discussion_" + id}
 	data.threads[i].Comments = append(data.threads[i].Comments, c)
+	d.changed = true
 	return d.shownComment(c), data.pendingInfo(), outcome
 }
 
@@ -295,6 +298,7 @@ func (d *demoSource) setResolved(_ context.Context, r repoRef, number int, threa
 		return false, refusedDemo("You can't change whether this conversation is resolved")
 	}
 	data.threads[i].Resolved = resolved
+	d.changed = true
 	return resolved, nil
 }
 
@@ -317,6 +321,7 @@ func (d *demoSource) editComment(_ context.Context, r repoRef, number int, comme
 		return threadComment{}, outcome
 	}
 	data.threads[i].Comments[j].Body = body
+	d.changed = true
 	return d.shownComment(data.threads[i].Comments[j]), outcome
 }
 
@@ -338,6 +343,7 @@ func (d *demoSource) deleteComment(_ context.Context, r repoRef, number int, com
 	if c.Author != d.me {
 		return nil, false, refusedDemo("You don't have permission to delete this comment")
 	}
+	d.changed = true
 	t := &data.threads[i]
 	t.Comments = append(t.Comments[:j:j], t.Comments[j+1:]...)
 	if len(t.Comments) == 0 {
@@ -392,6 +398,7 @@ func (d *demoSource) submitReview(_ context.Context, r repoRef, number int, revi
 		}
 	}
 	data.review = nil
+	d.changed = true
 	return p.URL + "#pullrequestreview-" + reviewID, outcome
 }
 
@@ -412,6 +419,7 @@ func (d *demoSource) publishReview(_ context.Context, r repoRef, number int, _, 
 	if !apply {
 		return "", outcome
 	}
+	d.changed = true
 	return p.URL + "#pullrequestreview-" + data.newID("PRR", number), outcome
 }
 
@@ -440,6 +448,7 @@ func (d *demoSource) discardReview(_ context.Context, r repoRef, number int, rev
 	}
 	data.threads = kept
 	data.review = nil
+	d.changed = true
 	return nil
 }
 

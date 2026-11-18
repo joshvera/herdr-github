@@ -27,10 +27,11 @@ import (
 // left this machine). After it, any failure is unknown, unless GitHub's own
 // answer says it refused.
 //
-// The transport may still try a request again on a new connection when it
-// knows nothing of the first try was written (net/http's nothingWrittenError,
-// HTTP/2's refused stream): GitHub never saw the first, so that isn't a
-// second mutation.
+// The transport replays a request on its own in a few cases (HTTP/1 when
+// nothing was written on a reused connection; HTTP/2 on a refused stream or
+// a GOAWAY above the stream), but only when it can rewind the body. The
+// request's GetBody is cleared so it never can: those cases come back as
+// errors instead, after WroteRequest, so unknown. One request, literally.
 
 // mutationDeadline bounds a whole act: the token, any reads, and the
 // mutation. The mod waits longer than this, so the binary always answers.
@@ -126,6 +127,7 @@ func (c *ghClient) mutate(ctx context.Context, query string, vars map[string]any
 	if err != nil {
 		return err
 	}
+	req.GetBody = nil // the transport can't replay what it can't rewind
 	req.Header.Set("Authorization", "bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", "herdr-github")

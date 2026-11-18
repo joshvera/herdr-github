@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"os"
 	"strings"
 	"testing"
 )
@@ -264,5 +265,21 @@ func TestAppDemoDiscardThenApprove(t *testing.T) {
 	c := demoRunAs[commentAnswer](t, demoDo(demoPR480, "comment", map[string]any{"head": demoHead(480), "path": "Sources/Onboarding/Welcome.swift", "line": 15, "side": "right", "body": "One more"}))
 	if !c.OK || c.Thread != nil || c.Review == nil || c.Review.Commit != demoHead(480) {
 		t.Fatalf("%+v", c)
+	}
+}
+
+// Only a change is saved: a refusal, or a poll that brought nothing, writes
+// nothing, so it can't undo what another process saved meanwhile.
+func TestAppDemoSavesOnlyAChange(t *testing.T) {
+	t.Setenv("HERDR_PLUGIN_STATE_DIR", t.TempDir())
+	appRun(t, demoDo(demoPR482, "resolve", map[string]any{"thread": "PRRT_demo_3"}))                    // refused
+	appRun(t, demoDo(demoPR482, "reply", map[string]any{"thread": "PRRT_demo_1", "body": demoUnknown})) // unknown, unchanged
+	demoRunAs[threadsAnswer](t, `{"op":"threads","demo":true,`+demoPR480+`}`)                           // nothing arrives on #480
+	if _, err := os.Stat(appDemoPath()); !os.IsNotExist(err) {
+		t.Fatalf("saved without a change: %v", err)
+	}
+	appRun(t, demoDo(demoPR482, "reply", map[string]any{"thread": "PRRT_demo_1", "body": demoUnknownSent})) // unknown, changed
+	if _, err := os.Stat(appDemoPath()); err != nil {
+		t.Fatalf("a change wasn't saved: %v", err)
 	}
 }

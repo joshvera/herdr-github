@@ -30,6 +30,10 @@ type demoSource struct {
 	// viewed (key → path → viewed, unviewed, dismissed): see demo_files.go.
 	filesData map[string]*demoPRFiles
 	viewed    map[string]map[string]string
+	// changed: a review action or poll changed the review state, so it's to
+	// be saved. Only then: a process that saved what it loaded unchanged
+	// could undo another's change made meanwhile.
+	changed bool
 }
 
 func newDemoSource() *demoSource {
