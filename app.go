@@ -267,10 +267,29 @@ func appError(err error) map[string]any {
 	case errors.As(err, &nc):
 		e["noCheckout"] = map[string]string{"repo": nc.Repo.String(), "dest": nc.Dest}
 	}
+	var a *actError
+	if errors.As(err, &a) {
+		if a.unknown {
+			e["unknown"] = true
+		}
+		if a.hasReview {
+			e["review"] = a.review // null when there's none
+		}
+		if a.changed {
+			e["changed"] = true
+		}
+	}
 	return e
 }
 
 func appAnswer(ctx context.Context, cfg config, req appRequest) (any, error) {
+	if req.Op == "act" {
+		// Every act is a mutation: the whole of it, reads and all, is bounded,
+		// so the mod (which waits longer) always gets an answer.
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, mutationDeadline)
+		defer cancel()
+	}
 	var demo *appDemo
 	var src source
 	if req.Demo {

@@ -74,6 +74,15 @@ type threadComment struct {
 	URL     string `json:"url"`
 }
 
+// reviewInfo is the viewer's pending review: its body, how many comments it
+// holds, and the commit it's pinned to.
+type reviewInfo struct {
+	ID       string `json:"id"`
+	Body     string `json:"body"`
+	Comments int    `json:"comments"`
+	Commit   string `json:"commit"`
+}
+
 // diffAnswer is the `diff` op's answer.
 type diffAnswer struct {
 	Head  string    `json:"head"`
@@ -467,7 +476,7 @@ func (c *ghClient) setViewed(ctx context.Context, r repoRef, number int, head, p
 	if viewed {
 		mutation = "markFileAsViewed"
 	}
-	return c.graphql(ctx, `mutation($id: ID!, $path: String!) {
+	return c.mutate(ctx, `mutation($id: ID!, $path: String!) {
   `+mutation+`(input: {pullRequestId: $id, path: $path}) { clientMutationId }
-}`, map[string]any{"id": id, "path": path}, nil)
+}`, map[string]any{"id": id, "path": path}, mutation, nil)
 }
