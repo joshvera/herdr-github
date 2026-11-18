@@ -18,7 +18,7 @@ import { tones, tint, countPill, groupOf, toneColor, prLook, checkLook, ago, ico
 import { PR_TABS, tabFor, prRoute } from "./prkeys.js";
 import { FilesView } from "./files.js";
 import { Store } from "./store.js";
-import { whoOf, sameWho, empty, seed, listPatch, resolveRepo, pickedRepo, staleMark, stamper, takesOver, canAct } from "./cache.js";
+import { whoOf, sameWho, mergeWho, empty, seed, listPatch, resolveRepo, pickedRepo, staleMark, stamper, takesOver, canAct } from "./cache.js";
 
 // The herdr-github this mod is part of (its release; the repo's tests hold it
 // to herdr-plugin.toml's version).
@@ -302,6 +302,8 @@ export default class GitHub extends View {
       cx.notify();
     });
     cx.timer.every(60000, (cx) => this.screen === "list" && !this.busy && this.loadAll(cx));
+    // Status not confirmed yet (it failed): ask again, or nothing is kept.
+    cx.timer.every(60000, () => !this.demo && !this.who && this.findGitHub().catch(() => {}));
     // The row the cursor rests on: its detail, fetched ahead (warm).
     this.rest = null;
     this.warming = false;
@@ -343,6 +345,9 @@ export default class GitHub extends View {
     const order = [this.on, "", ...machines().filter((m) => m.name && m.layout !== "unavailable").map((m) => m.name)];
     const tried = new Set();
     let last;
+    // The account the cache is from has signed out on its machine: said on
+    // whichever error is thrown last, not just that machine's.
+    let cachedSignedOut = false;
     for (const m of order) {
       if (m == null || tried.has(m)) continue;
       tried.add(m);
@@ -352,7 +357,7 @@ export default class GitHub extends View {
         if (!who) {
           last = new Error(s.hosts.map((h) => h.error).join("; ") || "gh isn't signed in");
           // The account the cache is from has signed out there.
-          if (m === this.cachedWho()?.machine) last.cachedSignedOut = true;
+          if (m === this.cachedWho()?.machine) cachedSignedOut = true;
           continue;
         }
         this.on = m;
@@ -365,7 +370,9 @@ export default class GitHub extends View {
       }
     }
     this.on = null;
-    throw last ?? new Error("no machine answered");
+    const e = last ?? new Error("no machine answered");
+    e.cachedSignedOut = cachedSignedOut;
+    throw e;
   }
 
   // The who of what's shown and kept: confirmed this opening, else the cache's.
@@ -379,8 +386,9 @@ export default class GitHub extends View {
   // (load, when its old answer comes back dropped).
   confirmWho(who) {
     const was = this.cachedWho();
-    this.who = who;
-    if (was && !sameWho(was, who)) {
+    const same = was && sameWho(was, who);
+    this.who = same ? mergeWho(was, who) : who;
+    if (was && !same) {
       this.forget();
       this.store.write("lists", { who });
       this.store.write("details", { who });
@@ -394,6 +402,13 @@ export default class GitHub extends View {
     this.lists = {};
     this.cache = empty("lists", this.who);
     this.forgetDetail();
+    // A PR opened from a list that's gone: back to the list. One opened
+    // straight (Recap, Linear) stays, and its detail is asked again
+    // (loadDetail, when its old answer comes back dropped).
+    if (this.screen === "pr" && !this.direct) {
+      this.screen = "list";
+      this.menu = this.parked = null;
+    }
   }
 
   // One request where gh is signed in; `opts` go to exec (see ask).
@@ -592,7 +607,8 @@ export default class GitHub extends View {
         l.next = res.next;
         l.warning = res.warning ?? "";
         l.error = "";
-        l.cached = false;
+        // A next page doesn't make the first one fresh.
+        if (!more) l.cached = false;
         if (!more) this.persist("lists", listPatch(null, tab, spec, l, at));
       }
       l.loaded = true;
@@ -704,7 +720,11 @@ export default class GitHub extends View {
     cx.spawn(async (cx) => {
       try {
         const d = await this.gh({ op: "detail", pr: prID(pr) });
-        if (gen !== this.gen) return;
+        if (gen !== this.gen) {
+          // Asked as an account that's since changed: ask again as this one.
+          if (this.screen === "pr" && this.cur?.key === pr.key) this.loadDetail(cx);
+          return;
+        }
         this.keepDetail(pr.key, d, at);
         if (!this.showDetail(pr.key, d, { at, cached: false })) return;
         this.cur = { ...pr, ...d };
@@ -1544,7 +1564,9 @@ export default class GitHub extends View {
   // The PR screen: what it is (state, title, author, branch, size), its
   // tabs, and the shown tab, every tab as tall so switching never jumps.
   prView(o) {
-    const pr = this.cur;
+    // Opened straight on a PR, `cur` has only its number: the header reads
+    // the detail too, cached or not (it never goes into `cur` or the lists).
+    const pr = this.direct && this.detail ? { ...this.cur, ...this.detail } : this.cur;
     const d = this.detail;
     const info = this.detailInfo;
     const mark = staleMark(Boolean(info?.cached), info?.at, info?.error ?? "");

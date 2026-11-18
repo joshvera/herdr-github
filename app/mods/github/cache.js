@@ -86,6 +86,17 @@ export function sameWho(a, b) {
   return b.hosts.every((h) => !logins.has(h.host) || logins.get(h.host) === h.login);
 }
 
+// Two confirmations of the same account as one: the newer's hosts, and the
+// older's that the newer lacks (they errored this time). Dropping those
+// would let a later sign-in as someone else there pass as the same who.
+export function mergeWho(a, b) {
+  const [older, newer] = a.at <= b.at ? [a, b] : [b, a];
+  const has = new Set(newer.hosts.map((h) => h.host));
+  const hosts = [...newer.hosts, ...older.hosts.filter((h) => !has.has(h.host))]
+    .sort((x, y) => (x.host < y.host ? -1 : x.host > y.host ? 1 : 0));
+  return { machine: newer.machine, hosts, at: newer.at };
+}
+
 // ── writes ─────────────────────────────────────────────────────────────────
 
 // A copy's write onto what the file holds now: the entries it produced,
@@ -96,7 +107,7 @@ export function applyPatch(doc, patch, kind, now) {
   if (!patch?.who) return null;
   let out;
   if (doc.who && sameWho(doc.who, patch.who)) {
-    out = { ...doc, who: patch.who.at >= doc.who.at ? patch.who : doc.who };
+    out = { ...doc, who: mergeWho(doc.who, patch.who) };
     for (const m of MAPS[kind]) out[m] = { ...doc[m] };
   } else {
     if (doc.who && doc.who.at > patch.who.at) return null;
@@ -224,6 +235,8 @@ export function listPatch(who, tab, spec, l, saved) {
 export function resolveRepo(kept, found) {
   const keptSpec = kept?.repo || null;
   if (found.kind === "failed") return { spec: keptSpec, keep: null };
+  // A pick in a folder with no GitHub remote stays while it has none.
+  if (found.kind === "none" && kept?.picked && !kept.found) return { spec: keptSpec, keep: null };
   if (found.kind === "none") return { spec: null, keep: kept && !kept.repo && !kept.found ? null : { repo: "", found: "", picked: false } };
   if (kept?.picked && kept.found === found.spec) return { spec: keptSpec, keep: null };
   if (kept && !kept.picked && kept.repo === found.spec) return { spec: found.spec, keep: null };

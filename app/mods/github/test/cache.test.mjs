@@ -2,7 +2,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
-  VERSION, LIMITS, empty, parse, whoOf, sameWho, applyPatch, writeWith, serial, stamper,
+  VERSION, LIMITS, empty, parse, whoOf, sameWho, mergeWho, applyPatch, writeWith, serial, stamper,
   seed, listPatch, resolveRepo, pickedRepo, takesOver, canAct, staleMark, utf8Length,
 } from "../cache.js";
 
@@ -343,4 +343,24 @@ test("the stale mark says it's refreshing, or why not, with the age; nothing whe
   assert.equal(staleMark(true, at, ""), "Refreshing… · from 14:02");
   assert.equal(staleMark(true, at, "timed out"), "timed out · showing from 14:02");
   assert.equal(staleMark(true, at, "", false), "from 14:02");
+});
+
+test("a host that errored once is kept in who, so a later sign-in as someone else there is caught", async () => {
+  const both = whoOf("", [{ host: "github.com", login: "alice" }, { host: "ghe.io", login: "bob" }], 1);
+  const flaky = whoOf("", [{ host: "github.com", login: "alice" }, { host: "ghe.io", error: "timeout" }], 2);
+  const f = memFile();
+  await writeWith(f, "p", "lists", { who: both }, () => NOW);
+  await writeWith(f, "p", "lists", { who: flaky }, () => NOW);
+  const kept = parse(f.text, "lists").who;
+  assert.deepEqual(kept.hosts, both.hosts, "ghe.io's bob survives the flaky confirmation");
+  assert.equal(kept.at, 2);
+  const carol = whoOf("", [{ host: "github.com", login: "alice" }, { host: "ghe.io", login: "carol" }], 3);
+  assert.equal(sameWho(kept, carol), false);
+  assert.deepEqual(mergeWho(flaky, both).hosts, both.hosts, "order of arguments doesn't matter");
+});
+
+test("a repo picked in a folder with no GitHub remote stays picked", () => {
+  const picked = pickedRepo({ repo: "", found: "", picked: false }, A);
+  assert.deepEqual(resolveRepo(picked, { kind: "none" }), { spec: A, keep: null });
+  assert.deepEqual(resolveRepo(picked, { kind: "found", spec: B }), { spec: B, keep: { repo: B, found: B, picked: false } }, "a remote appearing is a change");
 });
