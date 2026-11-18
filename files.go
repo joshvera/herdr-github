@@ -220,7 +220,10 @@ const (
 	reviewFields = `id body state viewerDidAuthor commit { oid } comments { totalCount }`
 	// pendingReviews are the PR's pending reviews the viewer can see: only
 	// their own, but filtered on viewerDidAuthor all the same (pendingOf).
-	pendingReviews = `reviews(states: PENDING, first: 20) { nodes { ` + reviewFields + ` } }`
+	pendingReviews = `reviews(states: PENDING, first: 20) ` + pendingReviewNodes
+	// pendingReviewNodes is pendingReviews' selection set, apart so a
+	// directive can go between the two (GraphQL wants it before the braces).
+	pendingReviewNodes = `{ nodes { ` + reviewFields + ` } }`
 )
 
 type pageInfo struct {
@@ -236,7 +239,7 @@ const filesQuery = `query($owner: String!, $name: String!, $n: Int!, $review: Bo
       id headRefOid
       viewerDidAuthor @include(if: $review)
       state @include(if: $review)
-      ` + pendingReviews + ` @include(if: $review)
+      reviews(states: PENDING, first: 20) @include(if: $review) ` + pendingReviewNodes + `
       files(first: 100, after: $fa) @include(if: $files) {
         pageInfo { hasNextPage endCursor }
         nodes { path additions deletions changeType viewerViewedState }
