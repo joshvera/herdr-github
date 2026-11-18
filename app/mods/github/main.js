@@ -210,6 +210,10 @@ function place(s) {
 export default class GitHub extends View {
   init(_props, cx) {
     const p = props() ?? {};
+    // When it opened, and the tabs that have shown rows since: how long the
+    // first rows take on each, logged once (render).
+    this.openedAt = Date.now();
+    this.firstRows = new Set();
     this.demo = Boolean(p.demo);
     this.screen = "list";
     this.tab = localStorage.getItem("tab") ?? "mine";
@@ -1572,6 +1576,10 @@ export default class GitHub extends View {
     const o = tones(t);
     this.shown = this.shownList();
     if (this.screen === "list" && !this.pickingRepo()) this.at = Math.max(0, Math.min(this.at, this.shown.length - 1));
+    if (this.screen === "list" && this.shown.length && !this.firstRows.has(this.tab)) {
+      this.firstRows.add(this.tab);
+      console.log(`github: first rows on ${this.tab} ${Date.now() - this.openedAt}ms after opening${this.lists[this.tab]?.cached ? " (cached)" : ""}`);
+    }
     const summary = this.demo ? "Demo · made-up org" : this.login ? `${this.login}${this.on ? ` · on ${this.on}` : ""}` : "";
     const note = this.busy || this.err || this.flash;
     const noteColor = this.busy ? o.accent : this.err ? o.fix : o.muted;
