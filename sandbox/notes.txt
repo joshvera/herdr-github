@@ -1,3 +1,5 @@
+inserted line A
+inserted line B
 sandbox line 1
 sandbox line 2
 sandbox line 3
@@ -38,3 +40,4 @@ sandbox line 37
 sandbox line 38
 sandbox line 39
 sandbox line 40
+sandbox line 41 new
