@@ -226,6 +226,7 @@ export default class GitHub extends View {
     this.flash = "";
     this.err = "";
     this.busy = "";
+    this.acting = new Set(); // the PRs (keys) a change was sent for, until GitHub answers
     this.repo = null;
     this.picking = false; // the repo tab's list of repos
     this.repos = null;
@@ -663,9 +664,13 @@ export default class GitHub extends View {
     cx.notify();
   }
 
-  // Changes the PR on GitHub, then reads it (and its lists) again.
+  // Changes the PR on GitHub, then reads it (and its lists) again. One
+  // change to a PR at a time: a second d sent before the first answers
+  // reads the draft state the first is changing.
   act(what, label, cx, after) {
     const pr = this.cur;
+    if (this.acting.has(pr.key)) return this.say(`#${pr.number} is still changing: one change at a time.`, cx);
+    this.acting.add(pr.key);
     this.busy = label;
     this.menu = null;
     cx.notify();
@@ -678,6 +683,7 @@ export default class GitHub extends View {
       } catch (e) {
         this.say(String(e?.message ?? e), cx, true);
       }
+      this.acting.delete(pr.key);
       this.busy = "";
       // What follows (a merge's cleanup) is about this PR: only while it's
       // still the one shown, never another PR's or the list's.
@@ -968,10 +974,13 @@ export default class GitHub extends View {
   // A key pressed in the popup. While the Files tab's filter has the
   // keyboard the key is the filter's: it isn't stopped (so it types), and
   // only the Files view sees it (enter, ↑ ↓); escape still leaves the filter.
+  // A held escape does nothing: its repeats would close the menu, the PR
+  // and then the popup.
   keyDown(e, cx) {
     const k = e.keystroke;
-    if (k === "escape") this.escape(cx);
-    else if (this.filesTyping()) {
+    if (k === "escape") {
+      if (!e.is_held) this.escape(cx);
+    } else if (this.filesTyping()) {
       this.files.typingKey(k, cx);
       return cx.notify();
     } else if (!this.press(k, cx, Boolean(e.is_held))) return;
@@ -1001,7 +1010,7 @@ export default class GitHub extends View {
   // or the PR's actions.
   prKey(k, cx, held) {
     if (this.prTab === "files" && this.files?.key(k, cx, held)) return true;
-    switch (prRoute(k, this.prTab, Boolean(this.menu))) {
+    switch (prRoute(k, this.prTab, Boolean(this.menu), held)) {
       case "menu":
         return this.menuKey(k, cx, held);
       case "tab":
