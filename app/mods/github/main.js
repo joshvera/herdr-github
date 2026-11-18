@@ -303,11 +303,27 @@ export default class GitHub extends View {
     });
     cx.timer.every(60000, (cx) => this.screen === "list" && !this.busy && this.loadAll(cx));
     // Status not confirmed yet (it failed): ask again, or nothing is kept.
-    cx.timer.every(60000, () => !this.demo && !this.who && this.findGitHub().catch(() => {}));
+    cx.timer.every(60000, (cx) => {
+      if (this.demo || this.who) return;
+      cx.spawn(async (cx) => {
+        try {
+          await this.findGitHub();
+          this.err = "";
+          this.loadMissing(cx);
+        } catch (e) {
+          this.statusFailed(e);
+        }
+        cx.notify();
+      });
+    });
     // The row the cursor rests on: its detail, fetched ahead (warm).
     this.rest = null;
     this.warming = false;
-    cx.timer.every(200, (cx) => this.warmTick(cx));
+    this.settledGen = this.gen;
+    cx.timer.every(200, (cx) => {
+      this.settle(cx);
+      this.warmTick(cx);
+    });
 
     // Key bindings and `herdr-app do`: github.escape, github.tab,
     // github.backtab, github.demo, github.next, github.prev, github.reload.
@@ -402,13 +418,33 @@ export default class GitHub extends View {
     this.lists = {};
     this.cache = empty("lists", this.who);
     this.forgetDetail();
-    // A PR opened from a list that's gone: back to the list. One opened
-    // straight (Recap, Linear) stays, and its detail is asked again
-    // (loadDetail, when its old answer comes back dropped).
-    if (this.screen === "pr" && !this.direct) {
-      this.screen = "list";
-      this.menu = this.parked = null;
+  }
+
+  // After forget() (which may run where there's no cx, inside a status
+  // search): a PR opened from a list that's gone goes back to the list; one
+  // opened straight (Recap, Linear) asks for its detail again; the lists
+  // load. Every 200 ms, at no cost when nothing was forgotten.
+  settle(cx) {
+    if (this.settledGen === this.gen) return;
+    this.settledGen = this.gen;
+    if (this.screen === "pr" && this.cur) {
+      if (!this.direct) this.toList(cx);
+      else if (!this.detail) this.loadDetail(cx);
     }
+    this.loadMissing(cx);
+    cx.notify();
+  }
+
+  // Status found no one signed in: said, and the cache's rows go if their
+  // account signed out. (A machine that didn't answer isn't a sign-out:
+  // what's shown stays, marked.)
+  statusFailed(e) {
+    if (e instanceof DevError) {
+      this.err = e.message;
+      return;
+    }
+    this.err = `Not signed in to GitHub on any machine: ${e?.message ?? e}. Run gh auth login on one.`;
+    if (e?.cachedSignedOut) this.forget();
   }
 
   // One request where gh is signed in; `opts` go to exec (see ask).
@@ -442,13 +478,7 @@ export default class GitHub extends View {
       await status;
       this.loadMissing(cx);
     } catch (e) {
-      if (e instanceof DevError) this.err = e.message;
-      else {
-        this.err = `Not signed in to GitHub on any machine: ${e?.message ?? e}. Run gh auth login on one.`;
-        // No rows from an account that's no longer signed in. (A machine
-        // that didn't answer isn't a sign-out: what's shown stays, marked.)
-        if (e?.cachedSignedOut) this.forget();
-      }
+      this.statusFailed(e);
     }
     await repo;
     cx.notify();
@@ -717,20 +747,24 @@ export default class GitHub extends View {
     const pr = this.cur;
     const at = this.stamp();
     const gen = this.gen;
+    const early = !this.who;
     cx.spawn(async (cx) => {
       try {
         const d = await this.gh({ op: "detail", pr: prID(pr) });
-        if (gen !== this.gen) {
-          // Asked as an account that's since changed: ask again as this one.
-          if (this.screen === "pr" && this.cur?.key === pr.key) this.loadDetail(cx);
-          return;
-        }
+        // Asked as an account that's since changed: settle asks again.
+        if (gen !== this.gen) return;
         this.keepDetail(pr.key, d, at);
         if (!this.showDetail(pr.key, d, { at, cached: false })) return;
         this.cur = { ...pr, ...d };
         this.replaceRow(d);
       } catch (e) {
-        if (this.cur?.key !== pr.key) return;
+        if (gen !== this.gen || this.screen !== "pr" || this.cur?.key !== pr.key) return;
+        // Asked on the cache's machine before status answered, and it's
+        // signed out there: once status finds GitHub, ask again (as load).
+        if (early && e?.signedOut && !this.demo) {
+          const found = await this.findGitHub().then(() => true, () => false);
+          if (found && gen === this.gen && this.screen === "pr" && this.cur?.key === pr.key) return this.loadDetail(cx);
+        }
         this.err = String(e?.message ?? e);
         // A cached Overview stays, marked with why and how old; r tries again.
         if (this.detailInfo?.cached) this.detailInfo.error = this.err;
@@ -833,6 +867,11 @@ export default class GitHub extends View {
       return run("mod.open", { name: "recap" });
     }
     this.direct = false;
+    this.toList(cx);
+  }
+
+  // The list again, on the row of the PR that was open.
+  toList(cx) {
     const key = this.cur?.key;
     this.screen = "list";
     this.menu = this.parked = null;
