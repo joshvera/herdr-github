@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.11.0-joshvera.1 - 2026-11-18
+
+The first release of the joshvera/herdr-github fork, a string upstream can
+never publish. It installs into `joshvera-<version>` and downloads from this
+fork's releases, never mrolafsson's.
+
+- **A PR's screen has three tabs** in the app: Overview, Checks and Files
+  changed (`1` `2` `3`, `tab` and `shift-tab`).
+- **Files changed**: the PR's files as a tree, one file's diff, and its
+  review threads between the lines they're on, with one key per move: next
+  line, next file, next thread, next unviewed file, and mark viewed (it
+  syncs to GitHub). It reads any PR the list can show, without a checkout.
+  New requests for it: `files`, `diff` and `act viewed`.
+- **The mod fetches the fork's binary**, so the tab works on any machine
+  with a release. `mods/github/dev.json` (`{"bin": "/absolute/path"}`) runs
+  a local build on this computer instead.
+
 ## 0.11.0 - 2026-11-04
 
 - **Update the branch** from the merge menu, in the TUI and the app: a PR

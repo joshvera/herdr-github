@@ -9,7 +9,7 @@
 set -eu
 cd "$(dirname "$0")/.."
 
-REPO="mrolafsson/herdr-github"
+REPO="joshvera/herdr-github"
 mkdir -p bin
 
 # HERDR_GITHUB_PREBUILT=1 downloads even with Go installed (scripts/test-build.sh

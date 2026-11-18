@@ -9,6 +9,9 @@ in the [Herdr app](https://herdr.dev), from any machine it's connected to,
 and in a [herdr](https://herdr.dev) TUI popup. Every PR knows its agents: the
 one that opened it and any that worked on it since, a key or a click away.
 
+This is a fork of [mrolafsson/herdr-github](https://github.com/mrolafsson/herdr-github)
+that adds a Files changed tab to a PR's screen in the Herdr app.
+
 ![The GitHub mod in the Herdr app, on the demo org: your pull requests grouped by whose move it is, each with its branch, checks, review, size and agents](app/preview.png)
 
 *In the Herdr app.*
@@ -58,12 +61,12 @@ one that opened it and any that worked on it since, a key or a click away.
 ### In the Herdr app
 
 Ask the agent in your Herdr window to *add the mod at
-github.com/mrolafsson/herdr-github/tree/main/app*: it follows the app's own
+github.com/joshvera/herdr-github/tree/main/app*: it follows the app's own
 steps (it reads the mod, copies it into `mods/`, merges its keys and checks
 it). Or from a terminal:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/mrolafsson/herdr-github/main/install.sh | sh -s -- --app
+curl -fsSL https://raw.githubusercontent.com/joshvera/herdr-github/main/install.sh | sh -s -- --app
 ```
 
 That's all: the mod fetches what it needs onto the machines it works on by
@@ -72,7 +75,7 @@ itself (see [In the Herdr app](#in-the-herdr-app-1)). ⌘G opens it.
 ### In the herdr TUI
 
 ```sh
-herdr plugin install mrolafsson/herdr-github
+herdr plugin install joshvera/herdr-github
 ```
 
 Then give the picker a key in `~/.config/herdr/config.toml`:
@@ -131,7 +134,7 @@ installs whichever of the two is on the computer, and both when both are.
 ### From a local checkout
 
 ```sh
-git clone https://github.com/mrolafsson/herdr-github
+git clone https://github.com/joshvera/herdr-github
 sh herdr-github/scripts/build.sh
 herdr plugin link "$PWD/herdr-github"
 ```
@@ -217,7 +220,7 @@ there is nothing to configure.
 | Plugin | What it adds to the others |
 | --- | --- |
 | [herdr-recap](https://github.com/mrolafsson/herdr-recap) | Every agent in one list. An agent's pull request and its Linear issue are links there: a click, or `ctrl+g` / `ctrl+l`, opens it in the plugin it belongs to. Snoozed agents have a tab of their own: `ctrl+s` snoozes an agent, in Snooze's popup, and `ctrl+w` wakes one. |
-| **[herdr-github](https://github.com/mrolafsson/herdr-github)** (this one) | Tags every space and agent with its branch's pull request (`#482 ✓ approved`), which Recap shows and groups its agents by. Opens straight on an agent's PR when Recap asks. |
+| **[herdr-github](https://github.com/joshvera/herdr-github)** (this one) | Tags every space and agent with its branch's pull request (`#482 ✓ approved`), which Recap shows and groups its agents by. Opens straight on an agent's PR when Recap asks. |
 | [herdr-linear](https://github.com/mrolafsson/herdr-linear) | Tags every space and agent with the Linear issue its branch is named for (`ENG-142 In Progress`), which Recap shows. Opens straight on that issue when Recap asks. |
 | [herdr-snooze](https://github.com/mrolafsson/herdr-snooze) | Hides an agent, or a whole space, from herdr's Agents panel until a time you pick, or until the agent's done or its pull request is merged (from herdr-github's labels). Tags each snoozed agent with when it wakes (`💤 17:30`, `💤 till done`), which Recap shows. Opens straight on an agent when Recap asks, and opens Recap on one with `r`. |
 | [herdr-vitals](https://github.com/mrolafsson/herdr-vitals) | How the machine is doing: right of Recap's tabs, a small graph of its CPU and a gauge of its memory, yellow from 80% and red from 90%, when there's room. A click on it opens Vitals on every machine you work on, and `esc` comes back. |

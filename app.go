@@ -27,7 +27,7 @@ import (
 
 // appVersion is this build's version, as herdr-plugin.toml has it (a test
 // holds them together): the mod checks it's the one it pinned.
-const appVersion = "0.11.0"
+const appVersion = "0.11.0-joshvera.1"
 
 // appRequest is what the mod asks.
 type appRequest struct {
@@ -43,7 +43,8 @@ type appRequest struct {
 	// machine's spaces), and whether to clone it when there's none.
 	Dirs  []string `json:"dirs,omitempty"`
 	Clone bool     `json:"clone,omitempty"`
-	Path  string   `json:"path,omitempty"` // unworktree: the worktree to remove
+	Path  string   `json:"path,omitempty"` // unworktree: the worktree to remove; diff, act viewed: the file
+	Head  string   `json:"head,omitempty"` // diff, act viewed: the PR's head commit the mod was shown
 	BG    bool     `json:"bg,omitempty"`   // run it as a job
 	Job   string   `json:"job,omitempty"`  // job: which; on a job's own run, where its answer goes
 }
@@ -255,7 +256,10 @@ func appError(err error) map[string]any {
 	e := map[string]any{"error": err.Error()}
 	var so *signedOutError
 	var nc *noCheckoutError
+	var st *staleError
 	switch {
+	case errors.As(err, &st):
+		e["stale"] = true
 	case errors.As(err, &so):
 		e["signedOut"] = so.Host
 	case errors.Is(err, errSignedOut):
@@ -338,6 +342,11 @@ func appAnswer(ctx context.Context, cfg config, req appRequest) (any, error) {
 	if err != nil {
 		return nil, err
 	}
+	// The Files changed view needs only the PR's repo, number and head, not
+	// the list row or the full detail, so it branches off before them.
+	if out, ok, err := appFilesOp(ctx, src, demo, req, r); ok {
+		return out, err
+	}
 	pr, err := src.byNumber(ctx, r, req.PR.Number)
 	if err != nil {
 		return nil, err
@@ -371,6 +380,65 @@ func appAnswer(ctx context.Context, cfg config, req appRequest) (any, error) {
 		return appWorktree(ctx, cfg, pr, req)
 	}
 	return nil, fmt.Errorf("no op %q", req.Op)
+}
+
+// appFilesOp answers the ops of the Files changed view, and says whether the
+// request was one: files, diff, and act viewed or unviewed. A diff for a head
+// that's in the cache answers from it before anything asks GitHub anything
+// (never for the demo, which has no cache and no network).
+func appFilesOp(ctx context.Context, src source, demo *appDemo, req appRequest, r repoRef) (any, bool, error) {
+	n := req.PR.Number
+	switch {
+	case req.Op == "files":
+		out, err := src.files(ctx, r, n)
+		return out, true, err
+	case req.Op == "diff":
+		if err := checkHeadAndPath(req); err != nil {
+			return nil, true, err
+		}
+		if demo == nil {
+			if files, ok := readDiffCache(r, n, req.Head); ok {
+				out, err := diffFrom(files, req.Head, req.Path)
+				return out, true, err
+			}
+		}
+		out, err := src.diff(ctx, r, n, req.Head, req.Path)
+		return out, true, err
+	case req.Op == "act" && (req.Do == "viewed" || req.Do == "unviewed"):
+		if err := checkHeadAndPath(req); err != nil {
+			return nil, true, err
+		}
+		viewed := req.Do == "viewed"
+		if err := src.setViewed(ctx, r, n, req.Head, req.Path, viewed); err != nil {
+			return nil, true, err
+		}
+		if demo != nil {
+			if err := demo.save(); err != nil {
+				return nil, true, err
+			}
+		}
+		note := fmt.Sprintf("Marked %s as viewed", clean(req.Path, false))
+		if !viewed {
+			note = fmt.Sprintf("Marked %s as not viewed", clean(req.Path, false))
+		}
+		return map[string]any{"ok": true, "note": note}, true, nil
+	}
+	return nil, false, nil
+}
+
+// checkHeadAndPath: a head from a request is a commit id before it's used
+// for anything (a cache file's name, say), and there's a file to name.
+func checkHeadAndPath(req appRequest) error {
+	if req.Head == "" {
+		return fmt.Errorf("%s needs the head commit the files were shown at", req.Op)
+	}
+	if !headPattern.MatchString(req.Head) {
+		return fmt.Errorf("%q isn't a commit id", req.Head)
+	}
+	if req.Path == "" {
+		return fmt.Errorf("%s needs a file path", req.Op)
+	}
+	return nil
 }
 
 // appAct changes the PR on GitHub, and says what it did.
@@ -634,6 +702,8 @@ type demoChange struct {
 	Auto  string      `json:"auto,omitempty"`
 	Queue *queueEntry `json:"queue,omitempty"`
 	Tree  bool        `json:"tree"`
+	// Which files of the PR are viewed, by path; absent in older saves.
+	Viewed map[string]string `json:"viewed,omitempty"`
 }
 
 func appDemoPath() string { return filepath.Join(stateDir(), "app-demo.json") }
@@ -658,6 +728,11 @@ func loadAppDemo() *appDemo {
 			}{"now", c.Auto}
 		}
 		d.src.trees[p.key()] = c.Tree
+		for path, state := range c.Viewed {
+			if _, ok := d.src.viewed[p.key()][path]; ok {
+				d.src.viewed[p.key()][path] = state
+			}
+		}
 	}
 	return d
 }
@@ -665,7 +740,7 @@ func loadAppDemo() *appDemo {
 func (d *appDemo) save() error {
 	saved := map[string]demoChange{}
 	for _, p := range d.src.prs {
-		c := demoChange{Draft: p.IsDraft, State: p.State, Merge: p.MergeStateStatus, Queue: p.MergeQueueEntry, Tree: d.src.trees[p.key()]}
+		c := demoChange{Draft: p.IsDraft, State: p.State, Merge: p.MergeStateStatus, Queue: p.MergeQueueEntry, Tree: d.src.trees[p.key()], Viewed: d.src.viewed[p.key()]}
 		if p.AutoMergeRequest != nil {
 			c.Auto = p.AutoMergeRequest.MergeMethod
 		}

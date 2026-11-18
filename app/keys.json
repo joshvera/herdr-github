@@ -1,4 +1,4 @@
 {
   "global": { "cmd-g": "mod.open:github" },
-  "mod:github": { "escape": "github.escape" }
+  "mod:github": { "escape": "github.escape", "tab": "github.tab", "shift-tab": "github.backtab" }
 }

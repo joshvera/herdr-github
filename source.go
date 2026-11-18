@@ -41,6 +41,15 @@ type source interface {
 	// updateBranch merges the base into a PR's branch that's behind it.
 	updateBranch(ctx context.Context, d *prDetail) error
 	deleteBranch(ctx context.Context, d *prDetail) error
+	// files, diff and setViewed are the Files changed view. They name the PR
+	// as repo and number, not a pullRequest, so they need no list or detail
+	// query first. head is the commit the caller was looking at.
+	files(ctx context.Context, r repoRef, number int) (filesAnswer, error)
+	// diff answers state "stale" (not an error) when the PR's head isn't head.
+	diff(ctx context.Context, r repoRef, number int, head, path string) (diffAnswer, error)
+	// setViewed fails with a *staleError, without marking anything, when the
+	// PR's head isn't head.
+	setViewed(ctx context.Context, r repoRef, number int, head, path string, viewed bool) error
 	// repos pages through the repos you can reach, for the repo list:
 	// the first page with cursor "", then each page's next until it's "".
 	repos(ctx context.Context, cursor string) ([]repoInfo, string, error)
@@ -197,6 +206,18 @@ func (s *githubSource) deleteBranch(ctx context.Context, d *prDetail) error {
 		return errors.New("the branch is already gone")
 	}
 	return s.client(d.Host).deleteRef(ctx, d.HeadRef.ID)
+}
+
+func (s *githubSource) files(ctx context.Context, r repoRef, number int) (filesAnswer, error) {
+	return s.client(r.Host).files(ctx, r, number)
+}
+
+func (s *githubSource) diff(ctx context.Context, r repoRef, number int, head, path string) (diffAnswer, error) {
+	return s.client(r.Host).diff(ctx, r, number, head, path)
+}
+
+func (s *githubSource) setViewed(ctx context.Context, r repoRef, number int, head, path string, viewed bool) error {
+	return s.client(r.Host).setViewed(ctx, r, number, head, path, viewed)
 }
 
 func isPartial(err error) bool {

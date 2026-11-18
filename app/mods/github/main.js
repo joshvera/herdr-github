@@ -6,32 +6,36 @@
 //
 // The work is herdr-github's (`app`), the TUI plugin's own code, run on the
 // machine where gh is signed in. The mod fetches the herdr-github release it
-// needs onto each machine it asks, the first time.
+// needs onto each machine it asks, the first time (on this computer, a local
+// build in its place when dev.json names one).
 
 import { View, div } from "gpui-kit";
 import * as fs from "fs/promises";
-import { v_flex, h_flex, InputState, Input, TextView, Scrollbar, v_virtual_list, VirtualListScrollHandle } from "gpui-base";
+import { v_flex, h_flex, InputState, Input, TextView, Scrollbar, v_virtual_list, VirtualListScrollHandle, ScrollHandle } from "gpui-base";
 import { agents, panes, machines, spaces, run, exec, theme, appHome, props, closeOverlay, openOverlay, nextCommand, knownAgents } from "herdr";
 import { demoAgents, DEMO_REPO } from "./demo.js";
-import { tones, tint, countPill, groupOf, toneColor, prLook, checkLook, ago, icon, chip, words, key, MONO } from "./look.js";
+import { tones, tint, countPill, groupOf, toneColor, prLook, checkLook, ago, icon, chip, words, key, cap, MONO } from "./look.js";
+import { PR_TABS, tabFor, prRoute } from "./prkeys.js";
+import { FilesView } from "./files.js";
 
 // The herdr-github this mod is part of (its release; the repo's tests hold it
 // to herdr-plugin.toml's version).
-export const GITHUB_VERSION = "0.11.0";
+export const GITHUB_VERSION = "0.11.0-joshvera.1";
 
-// Puts that release on a machine, once: into a folder of its own version, so
-// it never touches a herdr-github installed for the TUI. The archive for the
-// machine's system is checked against the release's checksums before it's
-// used. Prints the binary's path.
+// Puts that release on a machine, once: from this fork's releases, into a
+// folder of the fork's own version (joshvera-<version>), so it never touches
+// a herdr-github installed for the TUI, nor mistakes an upstream build of the
+// same version for its own. The archive for the machine's system is checked
+// against the release's checksums before it's used. Prints the binary's path.
 const PROVISION = String.raw`
 v=$1
-dest="$HOME/.local/share/herdr-github/app/$v"
+dest="$HOME/.local/share/herdr-github/app/joshvera-$v"
 bin="$dest/herdr-github"
 [ -x "$bin" ] && { printf '%s' "$bin"; exit 0; }
 case "$(uname -s)" in Darwin) os=darwin ;; Linux) os=linux ;; *) echo "no herdr-github for $(uname -s)" >&2; exit 1 ;; esac
 case "$(uname -m)" in x86_64|amd64) arch=amd64 ;; arm64|aarch64) arch=arm64 ;; *) echo "no herdr-github for $(uname -m)" >&2; exit 1 ;; esac
 name="herdr-github_$v""_$os""_$arch.tar.gz"
-url="https://github.com/mrolafsson/herdr-github/releases/download/v$v"
+url="https://github.com/joshvera/herdr-github/releases/download/v$v"
 tmp=$(mktemp -d) || exit 1
 trap 'rm -rf "$tmp"' EXIT
 curl -fsSL "$url/$name" -o "$tmp/$name" && curl -fsSL "$url/checksums.txt" -o "$tmp/sums" || { echo "couldn't download herdr-github $v" >&2; exit 1; }
@@ -43,14 +47,43 @@ mkdir -p "$dest" && mv "$tmp/herdr-github" "$bin.new" && chmod 755 "$bin.new" &&
 printf '%s' "$bin"
 `;
 
+// A herdr-github built on this computer, to run in place of the release:
+// `mods/github/dev.json` in the app's home, `{"bin": "/absolute/path"}`. Only
+// for requests on this computer; other machines fetch the release as ever.
+// Kept out of the repo (.gitignore), so it's never shipped.
+const DEV = `${appHome()}/mods/github/dev.json`;
+
+// A dev.json that's there but wrong: said as it is, never worked around by
+// asking another machine instead.
+class DevError extends Error {}
+
+async function devBinary() {
+  const text = await fs.readFile(DEV, "utf8").catch(() => null);
+  if (text === null) return null;
+  let bin;
+  try {
+    bin = JSON.parse(text)?.bin;
+  } catch {
+    throw new DevError(`${DEV} isn't JSON`);
+  }
+  if (typeof bin !== "string" || !bin.startsWith("/")) throw new DevError(`${DEV} needs {"bin": "/absolute/path"}`);
+  const r = await exec("test", ["-x", bin]);
+  if (r.code !== 0) throw new DevError(`${DEV} names ${bin}, which isn't an executable file`);
+  return bin;
+}
+
+function provision(machine) {
+  return exec("sh", ["-c", PROVISION, "sh", GITHUB_VERSION], { on: machine }).then((r) => {
+    if (r.code !== 0 || !r.stdout.trim()) throw new Error(r.stderr.trim().split("\n").pop() || `herdr-github: exit ${r.code}`);
+    return r.stdout.trim();
+  });
+}
+
 const binaries = new Map();
 function binary(machine) {
   const k = machine ?? "";
   if (!binaries.has(k)) {
-    const p = exec("sh", ["-c", PROVISION, "sh", GITHUB_VERSION], { on: machine }).then((r) => {
-      if (r.code !== 0 || !r.stdout.trim()) throw new Error(r.stderr.trim().split("\n").pop() || `herdr-github: exit ${r.code}`);
-      return r.stdout.trim();
-    });
+    const p = (machine == null ? devBinary() : Promise.resolve(null)).then((dev) => dev ?? provision(machine));
     p.catch(() => binaries.delete(k));
     binaries.set(k, p);
   }
@@ -63,13 +96,34 @@ class AppError extends Error {
     super(res.error);
     this.signedOut = res.signedOut ?? null;
     this.noCheckout = res.noCheckout ?? null;
+    // The PR's head moved past the one the request named: read it again.
+    this.stale = Boolean(res.stale);
   }
 }
 
-// One request to herdr-github on a machine (null: this one).
-async function ask(req, machine) {
+// A request that ran out of time: the machine answered, slowly. Shown as it
+// is; asking another machine wouldn't make it faster.
+class TimedOut extends Error {}
+
+// exec's own limit when none is given.
+const EXEC_TIMEOUT = 30000;
+
+// One request to herdr-github on a machine (null: this one). `opts` go to
+// exec (a longer `timeout`, in ms).
+/** @param {{ timeout?: number }} [opts] */
+async function ask(req, machine, opts = {}) {
   const bin = await binary(machine);
-  const r = await exec("sh", ["-c", 'exec "$0" app "$1"', bin, JSON.stringify(req)], { on: machine });
+  const limit = opts.timeout ?? EXEC_TIMEOUT;
+  const started = Date.now();
+  let r;
+  try {
+    r = await exec("sh", ["-c", 'exec "$0" app "$1"', bin, JSON.stringify(req)], { ...opts, on: machine });
+  } catch (e) {
+    // exec rejects the same way for a timeout and an unreachable machine;
+    // only the time it took tells them apart.
+    if (Date.now() - started >= limit - 250) throw new TimedOut(`herdr-github didn't answer within ${Math.round(limit / 1000)}s`);
+    throw e;
+  }
   let res;
   try {
     res = JSON.parse(r.stdout);
@@ -128,6 +182,13 @@ const CARD_H = 74;
 const REPO_H = 36;
 const LIST_H = 560;
 
+// The PR screen's: its tabs' height (each as tall), Overview's side's width.
+const PR_BODY_H = 440;
+const SIDE_W = 280;
+
+// Checks, in the order they're counted and listed: what needs you first.
+const CHECK_ORDER = ["fail", "pending", "pass", "skip"];
+
 // Where the lists are kept between openings.
 const CACHE = `${appHome()}/github-cache.json`;
 
@@ -157,10 +218,16 @@ export default class GitHub extends View {
     this.at = 0;
     this.cur = null; // the PR open, as listed
     this.detail = null;
+    this.prTab = "overview"; // the PR screen's tab (PR_TABS)
     this.menu = null;
+    this.parked = null; // a menu that came while Overview wasn't shown
+    this.checkAt = 0; // the chosen check, on the Checks tab
+    this.checkScroll = ScrollHandle.new();
+    this.files = null; // the Files changed tab's view (files.js), one per PR opened
     this.flash = "";
     this.err = "";
     this.busy = "";
+    this.acting = new Set(); // the PRs (keys) a change was sent for, until GitHub answers
     this.repo = null;
     this.picking = false; // the repo tab's list of repos
     this.repos = null;
@@ -198,6 +265,15 @@ export default class GitHub extends View {
     this.input.focus();
     cx.timer.after(400, () => this.screen === "list" && this.input.focus());
 
+    // The Files tab's filter and its lists' positions: made here, as state
+    // has to be, and handed to each PR's FilesView.
+    const filter = InputState.new({ placeholder: "Filter files by path" });
+    filter.on("change", (_e, cx) => this.files?.filterChanged(filter.value(), cx));
+    filter.on("focus", (_e, cx) => this.files?.filterFocus(true, cx));
+    filter.on("blur", (_e, cx) => this.files?.filterFocus(false, cx));
+    filter.on("submit", (_e, cx) => this.files?.typingKey("enter", cx));
+    this.filesUI = { filter, diffScroll: VirtualListScrollHandle.new(), treeScroll: VirtualListScrollHandle.new(), height: PR_BODY_H };
+
     cx.spawn(async (cx) => {
       await this.readCache(cx);
       if (p.pr) this.openPR({ ...p.pr, key: `${p.pr.host}/${p.pr.repo}#${p.pr.number}`.toLowerCase(), title: `#${p.pr.number}`, labels: [] }, cx, true);
@@ -206,12 +282,14 @@ export default class GitHub extends View {
     });
     cx.timer.every(60000, (cx) => this.screen === "list" && !this.busy && this.loadAll(cx));
 
-    // Key bindings and `herdr-app do`: github.escape, github.demo, github.next,
-    // github.prev, github.reload.
+    // Key bindings and `herdr-app do`: github.escape, github.tab,
+    // github.backtab, github.demo, github.next, github.prev, github.reload.
+    // keys.json binds tab and shift-tab here: the app keeps them otherwise.
     cx.spawn(async (cx) => {
       for (;;) {
         const c = await nextCommand();
         if (c === "escape") this.escape(cx);
+        else if (c === "tab" || c === "backtab") this.press(c === "tab" ? "tab" : "shift-tab", cx);
         else if (c === "demo") {
           this.demo = !this.demo;
           this.lists = {};
@@ -249,6 +327,7 @@ export default class GitHub extends View {
         localStorage.setItem("on", m);
         return m || null;
       } catch (e) {
+        if (e instanceof DevError) throw e;
         last = e;
       }
     }
@@ -256,16 +335,18 @@ export default class GitHub extends View {
     throw last ?? new Error("no machine answered");
   }
 
-  async gh(req) {
-    if (this.demo) return ask({ ...req, demo: true }, null);
+  // One request where gh is signed in; `opts` go to exec (see ask).
+  /** @param {{ timeout?: number }} [opts] */
+  async gh(req, opts = {}) {
+    if (this.demo) return ask({ ...req, demo: true }, null, opts);
     if (this.on == null || !this.login) await this.findGitHub();
     try {
-      return await ask(req, this.on || null);
+      return await ask(req, this.on || null, opts);
     } catch (e) {
-      if (e instanceof AppError) throw e;
+      if (e instanceof AppError || e instanceof TimedOut || e instanceof DevError) throw e;
       // The machine went away, or herdr-github couldn't be fetched there: look again.
       await this.findGitHub();
-      return ask(req, this.on || null);
+      return ask(req, this.on || null, opts);
     }
   }
 
@@ -275,7 +356,7 @@ export default class GitHub extends View {
       if (!this.demo) await this.findGitHub();
       else this.login = "sam";
     } catch (e) {
-      this.err = `Not signed in to GitHub on any machine: ${e?.message ?? e}. Run gh auth login on one.`;
+      this.err = e instanceof DevError ? e.message : `Not signed in to GitHub on any machine: ${e?.message ?? e}. Run gh auth login on one.`;
       return cx.notify();
     }
     await this.findRepo();
@@ -363,7 +444,10 @@ export default class GitHub extends View {
   }
 
   reload(cx) {
-    if (this.screen === "pr") return this.loadDetail(cx);
+    if (this.screen === "pr") {
+      if (this.prTab === "files") this.files?.reload(cx);
+      return this.loadDetail(cx);
+    }
     this.loadAll(cx);
   }
 
@@ -440,7 +524,10 @@ export default class GitHub extends View {
     this.screen = "pr";
     this.cur = pr;
     this.detail = null;
-    this.menu = null;
+    this.prTab = "overview";
+    this.menu = this.parked = null;
+    this.checkAt = 0;
+    this.files = new FilesView(this, this.filesUI);
     this.err = this.flash = "";
     this.direct = direct;
     this.loadDetail(cx);
@@ -486,7 +573,7 @@ export default class GitHub extends View {
     this.direct = false;
     const key = this.cur?.key;
     this.screen = "list";
-    this.menu = null;
+    this.menu = this.parked = null;
     this.err = this.flash = "";
     const i = this.shownList().findIndex((p) => p.key === key);
     if (i >= 0) this.at = i;
@@ -494,11 +581,24 @@ export default class GitHub extends View {
     cx.notify();
   }
 
+  // A key that can come both ways, bound in keys.json (a command) and to
+  // on_key_down: once per press, so one escape never closes a menu and
+  // leaves the screen too. Presses closer together than this are one.
+  once(k) {
+    const now = Date.now();
+    if (this.pressed?.k === k && now - this.pressed.at < 80) return false;
+    this.pressed = { k, at: now };
+    return true;
+  }
+
   escape(cx) {
+    if (!this.once("escape")) return;
     if (this.menu) {
       this.menu = null;
       return cx.notify();
     }
+    // The Files tab first (its filter, when it has one), then back.
+    if (this.screen === "pr" && this.prTab === "files" && this.files?.escape(cx)) return cx.notify();
     if (this.screen === "pr") return this.back(cx);
     if (this.picking && this.repo) {
       this.picking = false;
@@ -524,15 +624,54 @@ export default class GitHub extends View {
     this.say(`Copied ${url}`, cx);
   }
 
+  // A menu, on Overview: shown at once there; one that comes while another
+  // tab is shown (after a merge, a worktree's question) waits for Overview.
+  //
+  // A menu nobody just asked for (it comes when GitHub or a machine
+  // answers) lands while the person is pressing other keys: 1 2 3 for tabs,
+  // a second enter. So it's `noDigits` (digits don't choose: confirm menus
+  // are the same) and opens on its last item, the one that does nothing.
+  // Choosing anything else takes ↑/↓ and enter, pressed on purpose.
+  showMenu(m, cx) {
+    if (this.screen === "pr" && this.prTab !== "overview") {
+      this.parked = m;
+      this.say(`${m.title} Press 1 to answer.`, cx);
+      return;
+    }
+    this.menu = m;
+    cx.notify();
+  }
+
+  // Shows a tab of the PR screen. Any menu closes (one parked shows on
+  // Overview); the Files tab is told, to load what it shows.
+  setPrTab(id, cx) {
+    if (!PR_TABS.some((t) => t.id === id)) return;
+    this.menu = null;
+    this.prTab = id;
+    if (id === "overview" && this.parked) {
+      // A parked menu is one nobody asked for, so it's `noDigits`: the 1
+      // that shows it, pressed again or held, chooses nothing.
+      this.menu = this.parked;
+      this.parked = null;
+      this.flash = "";
+    }
+    if (id === "files") this.files?.shown(cx);
+    cx.notify();
+  }
+
   say(text, cx, isErr = false) {
     this.flash = isErr ? "" : text;
     this.err = isErr ? text : "";
     cx.notify();
   }
 
-  // Changes the PR on GitHub, then reads it (and its lists) again.
+  // Changes the PR on GitHub, then reads it (and its lists) again. One
+  // change to a PR at a time: a second d sent before the first answers
+  // reads the draft state the first is changing.
   act(what, label, cx, after) {
     const pr = this.cur;
+    if (this.acting.has(pr.key)) return this.say(`#${pr.number} is still changing: one change at a time.`, cx);
+    this.acting.add(pr.key);
     this.busy = label;
     this.menu = null;
     cx.notify();
@@ -545,8 +684,11 @@ export default class GitHub extends View {
       } catch (e) {
         this.say(String(e?.message ?? e), cx, true);
       }
+      this.acting.delete(pr.key);
       this.busy = "";
-      if (ok && after) after(cx);
+      // What follows (a merge's cleanup) is about this PR: only while it's
+      // still the one shown, never another PR's or the list's.
+      if (ok && after && this.screen === "pr" && this.cur?.key === pr.key) after(pr, cx);
       this.loadDetail(cx);
       this.loadAll(cx);
       cx.notify();
@@ -568,21 +710,19 @@ export default class GitHub extends View {
     const items = d.merge.map((c) => ({
       label: c.label,
       run: (cx) => {
-        const go = (cx) => this.act({ do: c.do, method: c.method }, `${c.label}…`, cx, c.do === "merge" ? (cx) => this.cleanupMenu(cx) : null);
+        const go = (cx) => this.act({ do: c.do, method: c.method }, `${c.label}…`, cx, c.do === "merge" ? (pr, cx) => this.cleanupMenu(pr, cx) : null);
         if (!c.confirm) return go(cx);
-        this.menu = { title: c.confirm, items: [{ label: c.yes, run: go }, { label: "Cancel", run: () => {} }], at: 1, confirm: true };
-        cx.notify();
+        this.showMenu({ title: c.confirm, items: [{ label: c.yes, run: go }, { label: "Cancel", run: () => {} }], at: 1, noDigits: true }, cx);
       },
     }));
     items.push({ label: "Cancel", run: () => {} });
-    this.menu = { title: d.mergeTitle, items, at: 0 };
-    cx.notify();
+    this.showMenu({ title: d.mergeTitle, items, at: 0 }, cx);
   }
 
-  // After a merge: delete its branch on GitHub, remove its worktree.
-  cleanupMenu(cx) {
+  // After a merge of `pr` (the PR shown): delete its branch on GitHub,
+  // remove its worktree.
+  cleanupMenu(pr, cx) {
     const d = this.detail;
-    const pr = this.cur;
     const tree = this.treeOf(pr);
     const canDelete = d?.cleanup?.deleteBranch;
     if (!d || (!canDelete && !tree)) return;
@@ -624,8 +764,7 @@ export default class GitHub extends View {
     if (canDelete) items.push({ label: `Delete the branch ${d.head} on GitHub`, run: clean(true, false) });
     if (tree) items.push({ label: "Remove the worktree (and close its space)", run: clean(false, true) });
     items.push({ label: "Leave everything", run: () => {} });
-    this.menu = { title: `Merged #${d.number}. Clean up?`, items, at: 0 };
-    cx.notify();
+    this.showMenu({ title: `Merged #${d.number}. Clean up?`, items, at: items.length - 1, noDigits: true }, cx);
   }
 
   // ── worktrees ──────────────────────────────────────────────────────────
@@ -664,9 +803,8 @@ export default class GitHub extends View {
 
   // Opens the PR's worktree in a space, made if there's none; start: with an
   // agent in it, asked to look at the PR (only a new one: an existing one's
-  // agent may be busy).
-  worktree(cx, start, clone = null) {
-    const pr = this.cur;
+  // agent may be busy). `pr`: the PR it's for, the one shown when asked.
+  worktree(cx, start, clone = null, pr = this.cur) {
     if (!pr) return;
     this.busy = clone ? `Cloning ${pr.repo}…` : start ? "Starting…" : "Opening its worktree…";
     this.menu = null;
@@ -694,15 +832,18 @@ export default class GitHub extends View {
         }
         this.busy = "";
         if (!res) {
-          this.menu = {
+          // A question about this PR: only while it's still the one shown,
+          // never on another PR's screen or the list (as a merge's cleanup).
+          if (this.screen !== "pr" || this.cur?.key !== pr.key) return;
+          return this.showMenu({
             title: `No checkout of ${missing.repo} on any machine with spaces.`,
             items: [
-              { label: `Clone it into ${missing.dest}${missing.machine ? ` on ${missing.machine}` : ""}`, run: (cx) => this.worktree(cx, start, missing) },
+              { label: `Clone it into ${missing.dest}${missing.machine ? ` on ${missing.machine}` : ""}`, run: (cx) => this.worktree(cx, start, missing, pr) },
               { label: "Cancel", run: () => {} },
             ],
-            at: 0,
-          };
-          return cx.notify();
+            at: 1,
+            noDigits: true,
+          }, cx);
         }
         this.trees[pr.key] = { path: res.path, machine: where.machine };
         localStorage.setItem("trees", JSON.stringify(this.trees));
@@ -798,23 +939,29 @@ export default class GitHub extends View {
     const list = this.agentsOf(this.cur);
     if (!list.length) return this.say("No agents on it yet: w opens its worktree, s starts one there.", cx);
     if (list.length === 1) return this.goToAgent(list[0], cx);
-    this.menu = {
+    this.showMenu({
       title: `#${this.cur.number}'s agents`,
       items: [...list.map((a) => ({ label: `${a.name} · ${a.part}${a.resume ? " · resume" : ""}`, run: (cx) => this.goToAgent(a, cx) })), { label: "Cancel", run: () => {} }],
       at: 0,
-    };
-    cx.notify();
+    }, cx);
   }
 
   // ── keys ───────────────────────────────────────────────────────────────
 
-  menuKey(k, cx) {
+  // A menu's keys. A held key moves the choice but never makes it: its
+  // repeats come faster than anyone reads what they'd choose. A menu nobody
+  // asked for (`noDigits`) opens on the item that does nothing, at its end:
+  // its arrows stop there rather than wrap round to the first, which deletes.
+  menuKey(k, cx, held = false) {
     const m = this.menu;
     const n = m.items.length;
-    if (k === "down") m.at = (m.at + 1) % n;
-    else if (k === "up") m.at = (m.at + n - 1) % n;
+    const digit = /^[1-9]$/.test(k);
+    const move = (d) => (m.noDigits ? Math.max(0, Math.min(n - 1, m.at + d)) : (m.at + d + n) % n);
+    if (k === "down") m.at = move(1);
+    else if (k === "up") m.at = move(-1);
+    else if (held && (k === "enter" || digit)) return true;
     else if (k === "enter") this.choose(m.items[m.at], cx);
-    else if (!m.confirm && /^[1-9]$/.test(k) && Number(k) <= n) this.choose(m.items[Number(k) - 1], cx);
+    else if (!m.noDigits && digit && Number(k) <= n) this.choose(m.items[Number(k) - 1], cx);
     else return false;
     return true;
   }
@@ -825,14 +972,79 @@ export default class GitHub extends View {
     cx.notify();
   }
 
-  prKey(k, cx) {
-    if (this.menu) return this.menuKey(k, cx);
+  // A key pressed in the popup. While the Files tab's filter has the
+  // keyboard the key is the filter's: it isn't stopped (so it types), and
+  // only the Files view sees it (enter, ↑ ↓); escape still leaves the filter.
+  // A held escape does nothing: its repeats would close the menu, the PR
+  // and then the popup.
+  keyDown(e, cx) {
+    const k = e.keystroke;
+    if (k === "escape") {
+      if (!e.is_held) this.escape(cx);
+    } else if (this.filesTyping()) {
+      this.files.typingKey(k, cx);
+      return cx.notify();
+    } else if (!this.press(k, cx, Boolean(e.is_held))) return;
+    cx.stop_propagation();
+    cx.notify();
+  }
+
+  filesTyping() {
+    return this.screen === "pr" && this.prTab === "files" && Boolean(this.files?.typing);
+  }
+
+  // One key, from on_key_down (`held` when it's a repeat) or a command
+  // (tab, shift-tab): whether it was this screen's.
+  press(k, cx, held = false) {
+    if ((k === "tab" || k === "shift-tab") && !this.once(k)) return true;
+    if (this.screen === "pr" && this.cur) return this.prKey(k, cx, held);
+    if (this.menu) return this.menuKey(k, cx, held);
+    if (k === "tab" || k === "shift-tab") {
+      this.step(k === "tab" ? 1 : -1, cx);
+      return true;
+    }
+    return this.listKey(k, cx);
+  }
+
+  // A key on the PR screen, by its tab (prkeys.js has the rules). The Files
+  // tab's view has every key first; what it declines never reaches a menu
+  // or the PR's actions.
+  prKey(k, cx, held) {
+    if (this.prTab === "files" && this.files?.key(k, cx, held)) return true;
+    switch (prRoute(k, this.prTab, Boolean(this.menu), held)) {
+      case "menu":
+        return this.menuKey(k, cx, held);
+      case "tab":
+        this.setPrTab(tabFor(k, this.prTab), cx);
+        return true;
+      case "back":
+        this.back(cx);
+        return true;
+      case "link":
+        this.open(this.tabLink(), cx);
+        return true;
+      case "copy":
+        this.copy(this.tabLink(), cx);
+        return true;
+      case "reload":
+        this.reload(cx);
+        return true;
+      case "action":
+        return this.prAction(k, cx);
+      case "checks":
+        return this.checksKey(k, cx);
+      case "ignore":
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  // Overview's keys: what changes the PR, or leaves for its worktree,
+  // agents or issue.
+  prAction(k, cx) {
     const pr = this.cur;
     switch (k) {
-      case "left":
-      case "backspace":
-        this.back(cx);
-        break;
       case "w":
         this.worktree(cx, false);
         break;
@@ -845,25 +1057,41 @@ export default class GitHub extends View {
       case "d":
         this.toggleDraft(cx);
         break;
-      case "o":
-        this.open(pr.url, cx);
-        break;
-      case "y":
-        this.copy(pr.url, cx);
-        break;
       case "a":
         this.agentsKey(cx);
         break;
       case "l":
         this.openIssue(issueOf(pr, this.detail?.body), cx);
         break;
-      case "r":
-        this.loadDetail(cx);
-        break;
       default:
         return false;
     }
     return true;
+  }
+
+  // The Checks tab's keys: choose a check, open its run.
+  checksKey(k, cx) {
+    const cs = this.shownChecks();
+    if (!cs.length) return true;
+    if (k === "enter") {
+      const c = cs[this.checkAt];
+      if (c?.url) this.open(c.url, cx);
+      else this.say(`${c?.name ?? "That check"} has no run to open.`, cx);
+      return true;
+    }
+    const d = k === "down" || k === "j" ? 1 : -1;
+    this.checkAt = Math.max(0, Math.min(cs.length - 1, this.checkAt + d));
+    this.checkScroll.scroll_to_item(this.checkAt);
+    return true;
+  }
+
+  // What o opens and y copies: the PR, its checks, its files on GitHub.
+  tabLink() {
+    const url = this.cur?.url;
+    if (!url) return "";
+    if (this.prTab === "checks") return `${url}/checks`;
+    if (this.prTab === "files") return this.files?.link() ?? `${url}/files`;
+    return url;
   }
 
   listKey(k, cx) {
@@ -1066,37 +1294,16 @@ export default class GitHub extends View {
     this.scroll.scroll_to_item(this.at === 0 ? 0 : e);
   }
 
-  // The PR screen: what it is, whether it can merge and why not, its checks,
-  // reviews and agents; then its description, threads and conversation.
+  // The PR screen: what it is (state, title, author, branch, size), its
+  // tabs, and the shown tab, every tab as tall so switching never jumps.
   prView(o) {
     const pr = this.cur;
     const d = this.detail;
     const look = prLook(o, pr);
     const stateWord = pr.state === "MERGED" ? "Merged" : pr.state === "CLOSED" ? "Closed" : pr.draft ? "Draft" : pr.state ? "Open" : "";
-    const field = (label, kids) => h_flex().gap(10).items_center().min_h(24)
-      .child(div().flex_none().w(72).text_size(12).text_color(o.dim).child(label))
-      .child(h_flex().flex_1().min_w(0).gap(6).flex_wrap().items_center().children([kids].flat().filter(Boolean)));
-    const tree = this.treeOf(pr);
-    const ag = this.agentsOf(pr);
     const now = Date.now();
     const from = this.direct && this.backTo?.label ? this.backTo.label : this.direct && this.from === "recap" ? "Recap" : this.tabLabel(TABS.find((x) => x.id === this.tab), true);
-
-    const checks = d?.checkList ?? [];
-    const count = (x) => checks.filter((c) => c.outcome === x).length;
-    const kinds = ["fail", "pending", "pass", "skip"].filter(count);
-    const bar = checks.length
-      ? h_flex().flex_none().w(120).h(6).rounded(3).overflow_hidden().bg(o.line)
-        .children(kinds.map((x) => div().h_full().w(Math.max(4, Math.round((120 * count(x)) / checks.length))).bg(checkLook(o, x).color)))
-      : null;
-    const checkWords = kinds.map((x) => div().text_size(12).text_color(checkLook(o, x).color).child(`${count(x)} ${checkLook(o, x).word}`));
-    const reviewer = (r) => chip(o, `rv-${r.name}`, [
-      r.state === "APPROVED" ? icon("check", o.review, 12) : r.state === "CHANGES_REQUESTED" ? icon("cross", o.fix, 12) : r.state === "PENDING" ? icon("idle", o.work, 12) : null,
-      r.name, r.state === "PENDING" ? "requested" : r.state === "COMMENTED" ? "commented" : null,
-    ], { color: r.state === "APPROVED" ? o.review : r.state === "CHANGES_REQUESTED" ? o.fix : null });
-    const toneIcon = { ok: "done", err: "fix", queue: "queue", merged: "merged" }[d?.tone] ?? "idle";
-    const issueKey = issueOf(pr, d?.body);
-    // The failing and running checks, by name, each a link to its run.
-    const attention = checks.filter((c) => c.outcome === "fail" || c.outcome === "pending");
+    const body = this.prTab === "checks" ? this.checksTab(o) : this.prTab === "files" ? this.files.view(o) : this.overviewTab(o);
 
     return v_flex().flex_1().min_h(0).gap(10)
       .child(
@@ -1112,51 +1319,192 @@ export default class GitHub extends View {
           .when(Boolean(pr.updated), (el) => el.child(div().text_size(12).text_color(o.dim).child(`updated ${ago(pr.updated, now)}`))),
       )
       .child(div().flex_none().text_size(17).font_semibold().text_color(o.fg).line_height(1.35).child(pr.title))
-      .when(Boolean(d), (el) => el
-        .child(field("Author", [icon("person", o.dim, 13), div().text_color(o.fg).child(d.author)]))
-        .child(field("Branch", [chip(o, "head", [icon("branch", o.dim, 13), d.head], { mono: true }), div().text_color(o.dim).child("→"), chip(o, "base", [d.base], { mono: true }),
-          tree ? chip(o, "tree", [icon("worktree", o.accent, 12), "worktree"], { color: o.accent }) : div().text_size(12).text_color(o.dim).child("no worktree yet")]))
-        .when(Boolean(issueKey), (el) => el.child(field("Issue", chip(o, "issue", [icon("pr", o.accent, 12), issueKey, this.linear ? "in Linear" : null], { color: o.accent, click: (cx) => this.openIssue(issueKey, cx) }))))
-        .child(field("Changes", [div().text_color(o.review).child(`+${d.additions}`), div().text_color(o.fix).child(`−${d.deletions}`), div().text_color(o.dim).child(`· ${d.files} file${d.files === 1 ? "" : "s"}`)]))
-        .child(field("Reviews", d.reviewers.length ? d.reviewers.map(reviewer) : div().text_size(12).text_color(o.dim).child("none yet")))
-        .child(field("Checks", checks.length ? [bar, ...checkWords] : div().text_size(12).text_color(o.dim).child("none")))
-        .when(attention.length > 0, (el) => el.child(field("", attention.map((c, i) => {
-          const cl = checkLook(o, c.outcome);
-          return chip(o, `chk-${i}`, [icon(cl.icon, cl.color, 12), c.name, c.required ? "required" : null], { color: cl.color, click: c.url ? (cx) => this.open(c.url, cx) : null });
-        }))))
-        .when(d.labels.length > 0, (el) => el.child(field("Labels", d.labels.map((l) => chip(o, `lb-${l.name}`, [div().w(7).h(7).rounded_full().bg(`#${l.color}`), l.name])))))
-        // Whether it can merge, and if not why not, in its tone; and the way to.
-        .child(
-          h_flex().flex_none().mt(2).gap(10).items_center().px(12).py(8).rounded(8).bg(tint(toneColor(o, d.tone), 0.12))
-            .child(icon(toneIcon, toneColor(o, d.tone), 15))
-            .child(div().flex_1().min_w(0).font_medium().text_color(o.fg).child(d.ready))
-            .when(Boolean(d.auto && d.state === "OPEN"), (el) => el.child(chip(o, "auto", [`auto-merge on · ${d.auto.toLowerCase()}`], { color: o.accent })))
-            .when(d.state === "OPEN" && d.merge.length > 0, (el) => el.child(h_flex().id("merge-btn").flex_none().h(26).px(10).items_center().rounded(6)
-              .bg(o.accent).cursor_pointer().hover((s) => s.opacity(0.85))
-              .on_click((_e, cx) => this.mergeMenu(cx))
-              .child(div().text_size(12).font_semibold().text_color(o.surface).child(d.queueOn ? "Merge queue…" : "Merge…")))),
-        ))
-      .when(ag.length > 0, (el) => el.child(
-        v_flex().flex_none().gap(1)
-          .child(div().px(2).pb(2).text_size(10.5).font_semibold().text_color(o.dim).child(`AGENTS ${ag.length}`))
-          .children(ag.slice(0, 4).map((a, i) =>
-            h_flex().id(`ag-${i}`).h(28).px(8).gap(8).items_center().rounded(6).cursor_pointer().hover((s) => s.bg(o.raised))
-              .on_click((_e, cx) => this.goToAgent(a, cx))
-              .child(a.status === "working" ? div().relative().flex_none().w(14).h(14).child(icon("work", o.work, 14).spin(1100))
-                : a.status === "blocked" ? icon("need", o.need, 14) : icon(a.status ? "idle" : "person", o.dim, 14))
-              .child(div().min_w(0).truncate().text_size(12.5).font_medium().text_color(o.fg).child(a.name))
-              .child(div().flex_none().text_size(11.5).text_color(o.dim).child(a.part))
-              .child(h_flex().flex_none().h(18).px(6).gap(4).items_center().rounded(5).border_1().border_color(o.line).bg(o.sunk).font_family(MONO).text_size(10.5).text_color(o.fg)
-                .child(icon(a.machine ? "server" : "laptop", o.muted, 11)).child(div().child(a.machine ?? "this computer")))
-              .child(div().flex_1())
-              .child(div().flex_none().text_size(11.5).text_color(a.resume ? o.accent : o.dim).child(a.resume ? "resume" : a.status ?? ""))))))
-      .child(div().flex_none().h(1).bg(o.line))
+      .when(Boolean(d), (el) => el.child(
+        h_flex().flex_none().gap(8).flex_wrap().items_center().text_size(12)
+          .child(icon("person", o.dim, 13))
+          .child(div().font_medium().text_color(o.fg).child(d.author))
+          .child(chip(o, "head", [icon("branch", o.dim, 13), d.head], { mono: true }))
+          .child(div().text_color(o.dim).child("→"))
+          .child(chip(o, "base", [d.base], { mono: true }))
+          .child(div().font_family(MONO).text_color(o.review).child(`+${d.additions}`))
+          .child(div().font_family(MONO).text_color(o.fix).child(`−${d.deletions}`)),
+      ))
+      .child(this.prTabs(o))
+      .child(v_flex().id("pr-tab").h(PR_BODY_H).min_h(0).flex_shrink(1).child(body));
+  }
+
+  // The PR screen's tabs, each with its key and, past Overview, its count.
+  prTabs(o) {
+    const d = this.detail;
+    const counts = { checks: d ? String(d.checkList.length) : "", files: d ? String(d.files) : "" };
+    return h_flex().flex_none().gap(4).items_center().border_b_1().border_color(o.line)
+      .children(PR_TABS.map((tb, i) => {
+        const on = tb.id === this.prTab;
+        return h_flex().id(`prtab-${tb.id}`).flex_none().h(34).px(10).gap(7).items_center().cursor_pointer()
+          .when(on, (el) => el.border_b_2().border_color(o.accent))
+          .when(!on, (el) => el.hover((s) => s.bg(o.raised)))
+          .on_click((_e, cx) => {
+            this.setPrTab(tb.id, cx);
+            this.keys.focus();
+          })
+          .child(cap(o, String(i + 1)))
+          .child(div().text_size(12.5).when(on, (el) => el.font_semibold()).when(!on, (el) => el.font_medium()).text_color(on ? o.fg : o.muted).child(tb.label))
+          .when(tb.id in counts, (el) => el.child(countPill(o, counts[tb.id], on)));
+      }));
+  }
+
+  // What a tab shows before the PR's detail has come: loading, or why not.
+  waiting(o) {
+    return div().text_size(12.8).text_color(this.err ? o.fix : o.dim).child(this.err || "Loading…");
+  }
+
+  // Overview: whether it can merge, a strip of its checks, threads and
+  // approvals, and its description; at the side, who's on it and what it's
+  // linked to. Narrow, the side comes between.
+  overviewTab(o) {
+    const d = this.detail;
+    if (!d) return this.waiting(o);
+    const pr = this.cur;
+    const wide = this.width >= 820;
+    const main = v_flex().flex_1().min_w(0).min_h(0).gap(12)
+      .child(this.readiness(o, d))
+      .when(!wide, (el) => el.child(this.prSide(o, d, false)))
+      .child(v_flex().id("pr-body").flex_1().min_h(0).overflow_y_scrollbar().pr(6)
+        .child(TextView.markdown(`md-${pr.key}`, d.body).selectable(true).text_size(13).text_color(o.muted).on_link_click((url, cx) => this.open(url, cx))));
+    if (!wide) return main;
+    return h_flex().flex_1().min_h(0).gap(16).items_stretch().child(main).child(this.prSide(o, d, true));
+  }
+
+  // Whether it can merge, and if not why not, in its tone, with the way to;
+  // under it, its checks, unresolved threads and approvals.
+  readiness(o, d) {
+    const toneIcon = { ok: "done", err: "fix", queue: "queue", merged: "merged" }[d.tone] ?? "idle";
+    const checks = d.checkList;
+    const count = (x) => checks.filter((c) => c.outcome === x).length;
+    const approved = d.reviewers.filter((r) => r.state === "APPROVED").length;
+    const changes = d.reviewers.filter((r) => r.state === "CHANGES_REQUESTED").length;
+    const word = (text, color) => div().text_size(12).text_color(color).child(text);
+    const part = (id, title, said, bar, last = false) => v_flex().id(id).flex_1().min_w(0).gap(7).px(12).py(9)
+      .when(!last, (el) => el.border_r_1().border_color(o.line))
+      .child(h_flex().gap(8).items_center().flex_wrap().child(div().text_size(12.5).font_semibold().text_color(o.fg).child(title)).children(said))
+      .child(bar);
+    const bar = (parts) => {
+      const n = parts.reduce((s, [c]) => s + c, 0);
+      return h_flex().w_full().h(6).rounded(3).overflow_hidden().bg(o.line)
+        .children(parts.filter(([c]) => c > 0).map(([c, color]) => div().h_full().w(`${(100 * c) / n}%`).bg(color)));
+    };
+    return v_flex().flex_none().rounded(8).border_1().border_color(o.line).overflow_hidden()
       .child(
-        v_flex().id("pr-body").h(380).min_h(0).flex_shrink(1).overflow_y_scrollbar().pr(6)
-          .child(d
-            ? TextView.markdown(`md-${pr.key}`, d.body).selectable(true).text_size(13).text_color(o.muted).on_link_click((url, cx) => this.open(url, cx))
-            : div().text_size(12.8).text_color(this.err ? o.fix : o.dim).child(this.err || "Loading…")),
+        h_flex().gap(10).items_center().px(12).py(8).bg(tint(toneColor(o, d.tone), 0.12))
+          .child(icon(toneIcon, toneColor(o, d.tone), 15))
+          .child(div().flex_1().min_w(0).font_medium().text_color(o.fg).child(d.ready))
+          .when(Boolean(d.auto && d.state === "OPEN"), (el) => el.child(chip(o, "auto", [`auto-merge on · ${d.auto.toLowerCase()}`], { color: o.accent })))
+          .when(d.state === "OPEN" && d.merge.length > 0, (el) => el.child(h_flex().id("merge-btn").flex_none().h(26).px(10).items_center().rounded(6)
+            .bg(o.accent).cursor_pointer().hover((s) => s.opacity(0.85))
+            .on_click((_e, cx) => this.mergeMenu(cx))
+            .child(div().text_size(12).font_semibold().text_color(o.surface).child(d.queueOn ? "Merge queue…" : "Merge…")))),
+      )
+      .child(
+        h_flex().items_stretch().border_t_1().border_color(o.line).bg(o.sunk)
+          .child(part("ov-checks", "Checks",
+            checks.length ? CHECK_ORDER.filter(count).map((x) => word(`${count(x)} ${checkLook(o, x).word}`, checkLook(o, x).color)) : [word("none", o.dim)],
+            bar(CHECK_ORDER.map((x) => [count(x), checkLook(o, x).color]))))
+          .child(part("ov-threads", "Threads",
+            [d.threads ? word(`${d.threads} unresolved`, o.work) : word("none unresolved", o.dim)],
+            bar([[d.threads, o.work]])))
+          .child(part("ov-reviews", "Approvals",
+            approved || changes
+              ? [approved ? word(`${approved} approved`, o.review) : null, changes ? word(`${changes} want changes`, o.fix) : null].filter(Boolean)
+              : [word("none yet", o.dim)],
+            bar([[approved, o.review], [changes, o.fix], [d.reviewers.length - approved - changes, o.dim]]), true)),
       );
+  }
+
+  // Overview's side: its agents, reviewers, issue and worktree, labels.
+  prSide(o, d, wide) {
+    const pr = this.cur;
+    const tree = this.treeOf(pr);
+    const ag = this.agentsOf(pr);
+    const issueKey = issueOf(pr, d.body);
+    const section = (title, kids) => v_flex().flex_none().gap(6)
+      .child(div().text_size(10.5).font_semibold().text_color(o.dim).child(title))
+      .children(kids);
+    const reviewer = (r) => chip(o, `rv-${r.name}`, [
+      r.state === "APPROVED" ? icon("check", o.review, 12) : r.state === "CHANGES_REQUESTED" ? icon("cross", o.fix, 12) : r.state === "PENDING" ? icon("idle", o.work, 12) : null,
+      r.name, r.state === "PENDING" ? "requested" : r.state === "COMMENTED" ? "commented" : null,
+    ], { color: r.state === "APPROVED" ? o.review : r.state === "CHANGES_REQUESTED" ? o.fix : null });
+    const sections = [
+      ag.length ? section(`AGENTS ${ag.length}`, ag.slice(0, 4).map((a, i) => this.agentRow(o, a, i))) : null,
+      section("REVIEWERS", [d.reviewers.length
+        ? h_flex().gap(6).flex_wrap().children(d.reviewers.map(reviewer))
+        : div().text_size(12).text_color(o.dim).child("none yet")]),
+      section("LINKED", [h_flex().gap(6).flex_wrap().items_center()
+        .when(Boolean(issueKey), (el) => el.child(chip(o, "issue", [icon("pr", o.accent, 12), issueKey, this.linear ? "in Linear" : null], { color: o.accent, click: (cx) => this.openIssue(issueKey, cx) })))
+        .child(tree ? chip(o, "tree", [icon("worktree", o.accent, 12), "worktree"], { color: o.accent }) : div().text_size(12).text_color(o.dim).child("no worktree yet"))]),
+      d.labels.length ? section("LABELS", [h_flex().gap(6).flex_wrap().children(d.labels.map((l) => chip(o, `lb-${l.name}`, [div().w(7).h(7).rounded_full().bg(`#${l.color}`), l.name])))]) : null,
+    ].filter(Boolean);
+    return v_flex().id("pr-side").flex_none().gap(14)
+      .when(wide, (el) => el.w(SIDE_W).min_h(0).pl(16).border_l_1().border_color(o.line).overflow_y_scrollbar())
+      .children(sections);
+  }
+
+  // One of its agents: what it's called and doing; how it's on the PR, where.
+  agentRow(o, a, i) {
+    return v_flex().id(`ag-${i}`).flex_none().px(6).py(4).gap(2).rounded(6).cursor_pointer().hover((s) => s.bg(o.raised))
+      .on_click((_e, cx) => this.goToAgent(a, cx))
+      .child(h_flex().gap(8).items_center()
+        .child(a.status === "working" ? div().relative().flex_none().w(14).h(14).child(icon("work", o.work, 14).spin(1100))
+          : a.status === "blocked" ? icon("need", o.need, 14) : icon(a.status ? "idle" : "person", o.dim, 14))
+        .child(div().flex_1().min_w(0).truncate().text_size(12.5).font_medium().text_color(o.fg).child(a.name))
+        .child(div().flex_none().text_size(11.5).text_color(a.resume ? o.accent : o.dim).child(a.resume ? "resume" : a.status ?? "")))
+      .child(div().pl(22).truncate().text_size(11.5).text_color(o.dim).child(`${a.part} · ${a.machine ?? "this computer"}`));
+  }
+
+  // Its checks, failing first, then running, passing, skipped.
+  shownChecks() {
+    const rank = (c) => {
+      const i = CHECK_ORDER.indexOf(c.outcome);
+      return i < 0 ? CHECK_ORDER.length : i;
+    };
+    return [...(this.detail?.checkList ?? [])].sort((a, b) => rank(a) - rank(b));
+  }
+
+  // Checks: every check, one chosen; enter or a click on the chosen one
+  // opens its run.
+  checksTab(o) {
+    if (!this.detail) return this.waiting(o);
+    const cs = this.shownChecks();
+    if (!cs.length) return div().text_size(12.8).text_color(o.dim).child("No checks ran on it.");
+    this.checkAt = Math.max(0, Math.min(this.checkAt, cs.length - 1));
+    const count = (x) => cs.filter((c) => c.outcome === x).length;
+    return v_flex().flex_1().min_h(0).gap(8)
+      .child(h_flex().flex_none().gap(10).items_center().px(8)
+        .child(h_flex().flex_none().w(140).h(6).rounded(3).overflow_hidden().bg(o.line)
+          .children(CHECK_ORDER.filter(count).map((x) => div().h_full().w(`${(100 * count(x)) / cs.length}%`).bg(checkLook(o, x).color))))
+        .children(CHECK_ORDER.filter(count).map((x) => div().text_size(12).text_color(checkLook(o, x).color).child(`${count(x)} ${checkLook(o, x).word}`))))
+      .child(v_flex().id("checks").flex_1().min_h(0).overflow_y_scrollbar().track_scroll(this.checkScroll)
+        .children(cs.map((c, i) => {
+          const on = i === this.checkAt;
+          const cl = checkLook(o, c.outcome);
+          return h_flex().id(`chk-${i}`).flex_none().h(30).px(8).gap(10).items_center().rounded(6).cursor_pointer()
+            .when(on, (el) => el.bg(tint(o.accent, 0.14)))
+            .when(!on, (el) => el.hover((s) => s.bg(o.raised)))
+            .on_click((_e, cx) => {
+              if (on) return this.checksKey("enter", cx);
+              this.checkAt = i;
+              cx.notify();
+            })
+            .child(icon(cl.icon, cl.color, 13))
+            .child(div().flex_1().min_w(0).truncate().text_size(12.5).text_color(on ? o.fg : o.muted).child(c.name))
+            .when(c.required, (el) => el.child(chip(o, `chk-req-${i}`, ["required"])))
+            .child(div().flex_none().w(64).text_size(11.5).text_color(cl.color).child(cl.word));
+        })));
+  }
+
+  // A menu is drawn, and has the keys, only off the PR screen or on its
+  // Overview.
+  menuShown() {
+    return Boolean(this.menu) && (this.screen !== "pr" || this.prTab === "overview");
   }
 
   menuView(o) {
@@ -1169,14 +1517,14 @@ export default class GitHub extends View {
           .when(on, (el) => el.bg(tint(o.accent, 0.18)))
           .when(!on, (el) => el.hover((s) => s.bg(o.sunk)))
           .on_click((_e, cx) => this.choose(it, cx))
-          .when(!m.confirm, (el) => el.child(div().flex_none().w(14).font_family(MONO).text_size(11.5).text_color(o.dim).child(String(i + 1))))
+          .when(!m.noDigits, (el) => el.child(div().flex_none().w(14).font_family(MONO).text_size(11.5).text_color(o.dim).child(String(i + 1))))
           .child(div().text_size(13).when(on, (el) => el.font_medium()).text_color(on ? o.fg : o.muted).child(it.label));
       }));
   }
 
   footer(o) {
     const k = (keys, label, fn, id) => key(o, keys, label, fn, id);
-    if (this.menu) {
+    if (this.menuShown()) {
       return [
         k(["↑", "↓"], "choose", () => {}, "f-ch"),
         k(["enter"], "do it", (cx) => this.choose(this.menu.items[this.menu.at], cx), "f-go"),
@@ -1184,6 +1532,20 @@ export default class GitHub extends View {
       ];
     }
     if (this.screen === "pr") {
+      const tabs = k(["1", "2", "3"], "tabs", (cx) => this.setPrTab(tabFor("tab", this.prTab), cx), "f-tabs");
+      const back = k(["esc"], "back", (cx) => this.escape(cx), "f-esc");
+      // While its filter has the keyboard, 1 2 3 and esc are the filter's.
+      if (this.prTab === "files") return this.files.typing ? this.files.footer(k) : [...this.files.footer(k), tabs, back];
+      if (this.prTab === "checks") {
+        return [
+          k(["↑", "↓"], "choose", () => {}, "f-ch"),
+          k(["enter"], "open its run", (cx) => this.checksKey("enter", cx), "f-go"),
+          k(["o"], "GitHub", (cx) => this.open(this.tabLink(), cx), "f-o"),
+          k(["y"], "copy link", (cx) => this.copy(this.tabLink(), cx), "f-y"),
+          tabs,
+          back,
+        ];
+      }
       return [
         k(["w"], "worktree", (cx) => this.worktree(cx, false), "f-w"),
         k(["s"], "start an agent", (cx) => this.worktree(cx, true), "f-s"),
@@ -1193,7 +1555,8 @@ export default class GitHub extends View {
         ...(issueOf(this.cur, this.detail?.body) ? [k(["l"], "issue", (cx) => this.openIssue(issueOf(this.cur, this.detail?.body), cx), "f-l")] : []),
         k(["o"], "GitHub", (cx) => this.open(this.cur.url, cx), "f-o"),
         k(["y"], "copy link", (cx) => this.copy(this.cur.url, cx), "f-y"),
-        k(["esc"], "back", (cx) => this.escape(cx), "f-esc"),
+        tabs,
+        back,
       ];
     }
     return [
@@ -1231,13 +1594,7 @@ export default class GitHub extends View {
           cx.notify();
         }
       })
-      .on_key_down((e, cx) => {
-        const k = e.keystroke;
-        if (k === "escape") this.escape(cx);
-        else if (!(pr ? this.prKey(k, cx) : this.menu ? this.menuKey(k, cx) : this.listKey(k, cx))) return;
-        cx.stop_propagation();
-        cx.notify();
-      })
+      .on_key_down((e, cx) => this.keyDown(e, cx))
       .when(!pr, (el) => el
         .child(
           h_flex().h(36).flex_none().px(12).gap(10).items_center().rounded(9).border_1().border_color(o.line).bg(o.sunk)
@@ -1248,7 +1605,7 @@ export default class GitHub extends View {
         .child(this.tabBar(t, o))
         .child(this.listView(o)))
       .when(Boolean(pr), (el) => el.child(this.prView(o)))
-      .when(Boolean(this.menu), (el) => el.child(this.menuView(o)))
+      .when(this.menuShown(), (el) => el.child(this.menuView(o)))
       .when(Boolean(note), (el) => el.child(h_flex().flex_none().gap(8).items_center()
         .when(Boolean(this.busy), (el) => el.child(icon("work", o.accent, 12).spin(1100)))
         .child(div().flex_1().min_w(0).truncate().text_size(12).text_color(noteColor).child(note))))
