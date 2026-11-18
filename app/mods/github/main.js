@@ -17,6 +17,8 @@ import { demoAgents, DEMO_REPO } from "./demo.js";
 import { tones, tint, countPill, groupOf, toneColor, prLook, checkLook, ago, icon, chip, words, key, cap, MONO } from "./look.js";
 import { PR_TABS, tabFor, prRoute } from "./prkeys.js";
 import { FilesView } from "./files.js";
+import { Store } from "./store.js";
+import { whoOf, sameWho, empty, seed, listPatch, resolveRepo, pickedRepo, staleMark, stamper } from "./cache.js";
 
 // The herdr-github this mod is part of (its release; the repo's tests hold it
 // to herdr-plugin.toml's version).
@@ -189,9 +191,6 @@ const SIDE_W = 280;
 // Checks, in the order they're counted and listed: what needs you first.
 const CHECK_ORDER = ["fail", "pending", "pass", "skip"];
 
-// Where the lists are kept between openings.
-const CACHE = `${appHome()}/github-cache.json`;
-
 const machineOf = (address) => (address?.includes("/") ? address.split("/")[0] : null);
 const prID = (pr) => ({ host: pr.host, repo: pr.repo, number: pr.number });
 
@@ -200,6 +199,11 @@ function parseRemote(url) {
   const m = url.match(/^(?:[a-z+]+:\/\/)?(?:[^@/]+@)?([^:/]+)[:/]([^/]+)\/([^/\s]+?)(?:\.git)?\/?$/i);
   return m ? { host: m[1].toLowerCase(), owner: m[2], name: m[3] } : null;
 }
+
+const repoOfSpec = (spec) => {
+  const [host, owner, name] = spec.split("/");
+  return { host, owner, name };
+};
 
 // Where a space is now: its first terminal's live folder, else where it was made.
 function place(s) {
@@ -238,7 +242,16 @@ export default class GitHub extends View {
     this.sessions = {};
     this.trees = JSON.parse(localStorage.getItem("trees") ?? "{}");
     this.login = "";
-    this.on = localStorage.getItem("on"); // the machine gh is signed in on ("" here)
+    this.on = null; // the machine gh is signed in on ("" here): the cache's, until status says
+    // The cache (store.js, cache.js). `who`: who status said is signed in,
+    // this opening; nothing is written before (`confirmed`), and `gen`
+    // moves on when who changes, so answers asked for before are dropped.
+    this.store = new Store();
+    this.stamp = stamper(Date.now);
+    this.cache = empty("lists");
+    this.who = null;
+    this.gen = 0;
+    this.confirmed = new Promise((resolve) => (this.confirm = resolve));
     this.width = 900;
     this.from = p.back ?? null; // the mod it was opened from, to go back to
     // Where esc goes back to, when another mod opened it on a PR: that mod,
@@ -296,6 +309,7 @@ export default class GitHub extends View {
         else if (c === "tab" || c === "backtab") this.press(c === "tab" ? "tab" : "shift-tab", cx);
         else if (c === "demo") {
           this.demo = !this.demo;
+          this.gen++;
           this.lists = {};
           this.screen = "list";
           this.repo = null;
@@ -311,8 +325,13 @@ export default class GitHub extends View {
   // ── where things run ───────────────────────────────────────────────────
 
   // The machine gh is signed in on: the one that answered last, else this
-  // one, else each connected one in turn.
-  async findGitHub() {
+  // one, else each connected one in turn. One search at a time: the lists
+  // asked for at once all wait on the same one.
+  findGitHub() {
+    return (this.finding ??= this.searchGitHub().finally(() => (this.finding = null)));
+  }
+
+  async searchGitHub() {
     const order = [this.on, "", ...machines().filter((m) => m.name && m.layout !== "unavailable").map((m) => m.name)];
     const tried = new Set();
     let last;
@@ -321,14 +340,16 @@ export default class GitHub extends View {
       tried.add(m);
       try {
         const s = await ask({ op: "status" }, m || null);
-        const signed = s.hosts.find((h) => h.login);
-        if (!signed) {
+        const who = whoOf(m, s.hosts, Date.now());
+        if (!who) {
           last = new Error(s.hosts.map((h) => h.error).join("; ") || "gh isn't signed in");
+          // The account the cache is from has signed out there.
+          if (m === this.cachedWho()?.machine) last.cachedSignedOut = true;
           continue;
         }
         this.on = m;
-        this.login = signed.login;
-        localStorage.setItem("on", m);
+        this.login = who.hosts[0].login;
+        this.confirmWho(who);
         return m || null;
       } catch (e) {
         if (e instanceof DevError) throw e;
@@ -337,6 +358,34 @@ export default class GitHub extends View {
     }
     this.on = null;
     throw last ?? new Error("no machine answered");
+  }
+
+  // The who of what's shown and kept: confirmed this opening, else the cache's.
+  cachedWho() {
+    return this.who ?? this.cache.who;
+  }
+
+  // Status said who is signed in. Another account than the one the cache
+  // (or this opening) had: nothing shown or kept from before is theirs, so
+  // it all goes, from the screen and both files, and the lists load again
+  // (load, when its old answer comes back dropped).
+  confirmWho(who) {
+    const was = this.cachedWho();
+    this.who = who;
+    if (was && !sameWho(was, who)) {
+      this.forget();
+      this.store.write("lists", { who });
+      this.store.write("details", { who });
+    }
+    this.confirm();
+  }
+
+  // Drops every list and cached detail shown, and every answer on its way.
+  forget() {
+    this.gen++;
+    this.lists = {};
+    this.cache = empty("lists", this.who);
+    this.forgetDetail?.();
   }
 
   // One request where gh is signed in; `opts` go to exec (see ask).
@@ -354,32 +403,88 @@ export default class GitHub extends View {
     }
   }
 
+  // Everything at once: who is signed in (status), the space's repo, and,
+  // when the cache says which machine answered last, the lists there.
   async start(cx) {
     this.err = "";
-    try {
-      if (!this.demo) await this.findGitHub();
-      else this.login = "sam";
-    } catch (e) {
-      this.err = e instanceof DevError ? e.message : `Not signed in to GitHub on any machine: ${e?.message ?? e}. Run gh auth login on one.`;
-      return cx.notify();
+    if (this.demo) {
+      this.login = "sam";
+      await this.lookForRepo(cx);
+      return this.loadAll(cx);
     }
-    await this.findRepo();
-    this.loadAll(cx);
+    const status = this.findGitHub();
+    const repo = this.lookForRepo(cx);
+    if (this.cache.who) this.loadAll(cx);
+    try {
+      await status;
+      this.loadMissing(cx);
+    } catch (e) {
+      if (e instanceof DevError) this.err = e.message;
+      else {
+        this.err = `Not signed in to GitHub on any machine: ${e?.message ?? e}. Run gh auth login on one.`;
+        // No rows from an account that's no longer signed in. (A machine
+        // that didn't answer isn't a sign-out: what's shown stays, marked.)
+        if (e?.cachedSignedOut) this.forget();
+      }
+    }
+    await repo;
+    cx.notify();
   }
 
-  // The repo tab's repo: the shown space's, from its remotes.
+  // The space the popup opened over, and its folder: where its repo is looked
+  // for, and the key its repo is remembered by (machine and folder).
+  openedSpace() {
+    if (this.space === undefined) {
+      const s = spaces().find((s) => s.active);
+      const folder = (s && place(s)) || null;
+      this.space = folder ? { machine: s.machine ?? null, folder, key: `${s.machine ?? ""}:${folder}` } : null;
+    }
+    return this.space;
+  }
+
+  // The repo tab's repo: the shown space's, from its remotes. { kind:
+  // "found", spec } | { kind: "none" }: no GitHub remote there | { kind:
+  // "failed" }: the machine didn't answer.
   async findRepo() {
-    if (this.demo) return (this.repo = this.repo ?? DEMO_REPO);
-    const s = spaces().find((s) => s.active);
-    const folder = s && place(s);
-    if (!folder) return;
-    const r = await exec("git", ["-C", folder, "remote", "-v"], { on: s.machine }).catch(() => null);
-    if (!r || r.code !== 0) return;
+    const sp = this.openedSpace();
+    if (!sp) return { kind: "none" };
+    const r = await exec("git", ["-C", sp.folder, "remote", "-v"], { on: sp.machine }).catch(() => null);
+    if (!r) return { kind: "failed" };
+    if (r.code !== 0) return { kind: "none" };
     const remotes = new Map(r.stdout.split("\n").map((l) => l.split(/\s+/)).filter((p) => p.length >= 2).map(([name, url]) => [name, url]));
     for (const name of ["upstream", "origin", ...remotes.keys()]) {
       const repo = remotes.has(name) && parseRemote(remotes.get(name));
-      if (repo) return (this.repo = repo);
+      if (repo) return { kind: "found", spec: `${repo.host}/${repo.owner}/${repo.name}` };
     }
+    return { kind: "none" };
+  }
+
+  // What the space's remotes say, against the repo remembered for it: the
+  // same, nothing changes; another, it's shown and loaded instead; none, the
+  // tab clears; no answer, the remembered one stays.
+  async lookForRepo(cx) {
+    if (this.demo) {
+      this.repo ??= DEMO_REPO;
+      return;
+    }
+    const found = await this.findRepo();
+    const sp = this.openedSpace();
+    const { spec, keep } = resolveRepo(sp ? this.cache.spaces[sp.key] : null, found);
+    if (keep) this.keepSpace(keep);
+    if (spec === (this.repoSpec() || null)) return;
+    this.repo = spec ? repoOfSpec(spec) : null;
+    this.lists.repo = null;
+    this.load("repo", cx);
+    cx.notify();
+  }
+
+  // The repo remembered for the space the popup opened over.
+  keepSpace(entry) {
+    const sp = this.openedSpace();
+    if (!sp) return;
+    const e = { ...entry, saved: Date.now() };
+    this.cache.spaces[sp.key] = e;
+    this.persist("lists", { spaces: { [sp.key]: e } });
   }
 
   repoSpec() {
@@ -392,36 +497,54 @@ export default class GitHub extends View {
     for (const t of TABS) this.load(t.id, cx);
   }
 
+  // The tabs with no live answer and none on its way.
+  loadMissing(cx) {
+    for (const t of TABS) {
+      const l = this.lists[t.id];
+      if (!l?.loading && (!l?.loaded || l.cached || l.error)) this.load(t.id, cx);
+    }
+  }
+
+  // A tab's list, made empty if it has none. The repo tab's is for one repo
+  // (`spec`): another repo gets another list.
+  list(tab) {
+    return (this.lists[tab] ??= { prs: [], next: "", loaded: false, spec: tab === "repo" ? this.repoSpec() : "" });
+  }
+
   // The lists as they were last time, shown at once on opening while fresh
-  // ones are asked for: a file in the app's folder (a shared value would
-  // redraw every mod each time it's set). Never the demo's.
+  // ones are asked for, on every tab: the repo tab's from the repo last
+  // found or picked for this space. Never the demo's.
   async readCache(cx) {
     if (this.demo) return;
-    this.cache = JSON.parse((await fs.readFile(CACHE, "utf8").catch(() => null)) ?? "{}");
-    this.login ||= this.cache.login ?? "";
-    for (const t of ["mine", "review"]) this.seed(t, this.cache.lists?.[t]);
+    this.cache = await this.store.read("lists");
+    const who = this.cache.who;
+    if (who) {
+      this.on ??= who.machine;
+      this.login ||= who.hosts[0].login;
+    }
+    for (const t of ["mine", "review"]) seed(this.list(t), this.cache.lists[t]);
+    const sp = this.openedSpace();
+    const kept = sp && this.cache.spaces[sp.key];
+    if (kept?.repo && !this.repo) {
+      this.repo = repoOfSpec(kept.repo);
+      seed(this.list("repo"), this.cache.repos[kept.repo]);
+    }
     cx.notify();
   }
 
-  seed(tab, kept) {
-    const l = this.lists[tab];
-    if (!kept || this.demo || (l?.loaded && !l.cached)) return;
-    this.lists[tab] = { ...l, prs: kept.prs ?? [], next: kept.next ?? "", loaded: true, cached: true, loading: l?.loading };
-  }
-
-  keep(tab, l) {
+  // A patch for a cache file, written once status has said who it's for,
+  // and only if who hasn't changed since it was made.
+  persist(kind, patch) {
     if (this.demo) return;
-    const c = (this.cache ??= {});
-    c.login = this.login;
-    c.lists ??= {};
-    if (tab === "repo") (c.repos ??= {})[this.repoSpec()] = { prs: l.prs, next: l.next };
-    else c.lists[tab] = { prs: l.prs, next: l.next };
-    fs.writeFile(CACHE, JSON.stringify(c)).catch(() => {});
+    const gen = this.gen;
+    this.confirmed.then(() => {
+      if (gen === this.gen && this.who) this.store.write(kind, { ...patch, who: this.who });
+    });
   }
 
   load(tab, cx, more = false) {
-    if (tab === "repo" && !more && !this.lists.repo?.loaded) this.seed("repo", this.cache?.repos?.[this.repoSpec()]);
-    const l = (this.lists[tab] ??= { prs: [], next: "", loaded: false });
+    if (tab === "repo" && !more && !this.lists.repo?.loaded) seed(this.list("repo"), this.cache.repos[this.repoSpec()]);
+    const l = this.list(tab);
     if (l.loading || (more && !l.next)) return;
     if (tab === "repo" && !this.repo) {
       l.loaded = true;
@@ -429,19 +552,41 @@ export default class GitHub extends View {
     }
     l.loading = true;
     cx.notify();
+    // The repo it's for, and who it's asked as, are what they are now: an
+    // answer that comes after either changed is kept as theirs, or dropped.
+    const spec = l.spec;
+    const gen = this.gen;
+    const early = !this.who;
+    const at = this.stamp();
     cx.spawn(async (cx) => {
+      const req = { op: "list", tab, repo: spec, cursor: more ? l.next : "" };
+      let res = null;
+      let err = null;
       try {
-        const res = await this.gh({ op: "list", tab, repo: this.repoSpec(), cursor: more ? l.next : "" });
+        res = await this.gh(req).catch(async (e) => {
+          // Asked on the cache's machine before status answered, and it's
+          // signed out there: ask again wherever status finds GitHub.
+          if (!early || !e?.signedOut || this.demo) throw e;
+          await this.findGitHub();
+          return this.gh(req);
+        });
+      } catch (e) {
+        err = e;
+      }
+      l.loading = false;
+      if (gen !== this.gen) {
+        this.loadMissing(cx);
+        return cx.notify();
+      }
+      if (err) l.error = err?.signedOut ? `Not signed in to ${err.signedOut === true ? "GitHub" : err.signedOut}: run gh auth login` : String(err?.message ?? err);
+      else {
         l.prs = more ? [...l.prs, ...res.prs] : res.prs;
         l.next = res.next;
         l.warning = res.warning ?? "";
         l.error = "";
         l.cached = false;
-        if (!more) this.keep(tab, l);
-      } catch (e) {
-        l.error = e?.signedOut ? `Not signed in to ${e.signedOut === true ? "GitHub" : e.signedOut}: run gh auth login` : String(e?.message ?? e);
+        if (!more) this.persist("lists", listPatch(null, tab, spec, l, at));
       }
-      l.loading = false;
       l.loaded = true;
       cx.notify();
     });
@@ -514,6 +659,8 @@ export default class GitHub extends View {
     if (!r) return;
     const [owner, name] = r.repo.split("/");
     this.repo = { host: r.host, owner, name };
+    // Remembered for this space until its remote changes.
+    if (!this.demo) this.keepSpace(pickedRepo(this.cache.spaces[this.openedSpace()?.key], this.repoSpec()));
     this.picking = false;
     this.at = 0;
     this.input.set_value("");
@@ -1250,7 +1397,9 @@ export default class GitHub extends View {
     }
     const l = this.lists[this.tab];
     const shown = this.shown;
-    if (l?.error) notes.push(this.note(o, l.error, o.fix));
+    // Rows from the cache say so, quietly: being refreshed, or why they
+    // couldn't be, and how old they are.
+    if (l?.error) notes.push(this.note(o, l.cached ? staleMark(true, l.saved, l.error) : l.error, o.fix));
     else if (!shown.length) {
       const empty = this.err ? "" : !l?.loaded || l.loading ? "Loading…" : this.filter ? "No pull request matches." : this.tab === "review" ? "Nothing waiting on your review." : "No open pull requests.";
       if (empty) notes.push(this.note(o, empty));
@@ -1267,6 +1416,7 @@ export default class GitHub extends View {
       entries.push({ key: `pr-${pr.key}`, row: i, h: CARD_H, el: () => div().h(CARD_H).pb(2).child(this.card(o, pr, i === this.at, i)) });
     });
     if (l?.next) after.push(div().px(14).py(6).text_size(12).text_color(o.dim).child(l.loading ? "Loading more…" : "More below: ↓ loads them"));
+    if (l?.cached && !l.error && shown.length) after.push(div().px(14).py(6).text_size(11.5).text_color(o.dim).child(staleMark(true, l.saved, "", this.who == null || Boolean(l.loading))));
     if (l?.warning) after.push(div().px(14).py(6).text_size(11.5).text_color(o.dim).child(l.warning));
     return { notes, entries, after };
   }
