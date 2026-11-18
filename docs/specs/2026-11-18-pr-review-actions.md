@@ -1,6 +1,8 @@
 # Review actions on the Files changed tab
 
-Status: reviewed once (Opus, 2026-11-18), findings folded in.
+Status: reviewed twice (Opus, 2026-11-18). The second review's findings are
+in "Amendments" at the end. **Where an amendment and the text above
+disagree, the amendment wins.**
 Builds on `docs/specs/2026-11-16-pr-files-view.md` (read it first: this spec
 uses its ops, its head rules and its key table without repeating them).
 
@@ -658,3 +660,139 @@ Each step ends with the checks passing: `gofmt`, `go vet`,
 `node --test app/mods/github/test/*.test.mjs`,
 `herdr-app check app/mods/github`. An earlier commit (1e0ddfb) records
 `herdr-app check` hanging once; if it hangs, report it, do not drop it.
+
+## Amendments (second review)
+
+These override the text above.
+
+### A1. Outcome classes, made concrete
+
+- **Before sending.** Immediately before the mutation's HTTP request, check
+  the context and the time left. If less than 8 seconds of the 20 remain,
+  refuse: "Took too long to prepare. Nothing was sent." That is
+  **refused**.
+- **After sending.** Any error from the HTTP call or from reading its body
+  is **unknown**.
+- **Errors with data.** GitHub usually answers a refused mutation as
+  `{"data": {"<mutation>": null}, "errors": [...]}`. So: errors with a
+  **null** payload for the mutation and a refusal type are **refused**;
+  errors with a **non-null** payload are **unknown**. Confirm the shape on
+  the sandbox PR (Verify first) and write down what GitHub sent.
+- **Status codes.** 401 (the existing signed-out error) and 403 are
+  **refused**. 429 and a `RATE_LIMITED` error are **refused** (GitHub did
+  not act). Any 5xx is **unknown**.
+- **In the mod's caller.** A failure in `binary()` (finding or provisioning
+  the binary, before exec) is **refused**. Any exec rejection, a timeout,
+  or output that is not JSON is **unknown**: rejections cannot be told
+  apart (`main.js:122-125`).
+- The caller may run `findGitHub` **before** the single send when no
+  machine is chosen yet. It never runs it after, and never sends twice.
+- Refused and unknown both hand back the **whole answer**, not just the
+  error text, so `review` survives.
+- The existing `act` values (merge and the rest) get the same deadline and
+  the same `unknown` flag in the binary, not only the new caller in the
+  mod.
+
+### A2. What "found" is compared against
+
+At send time, before the exec, store in the draft the IDs of the viewer's
+comments on that target (the thread for a reply; the path, line and side
+for a new comment). "Found" means a comment by the viewer on that target
+whose ID is **not in that stored list**, with a matching body. This
+replaces "not in the last answer received before the send started", which
+is lost when the popup closes.
+
+Saving the draft's `sending` state and that ID list is synchronous, before
+the exec. It is not subject to the half-second throttle.
+
+### A3. Polls and mutations
+
+Replace the generations rule with:
+
+- No poll starts while a mutation is in flight. A tick that falls then is
+  skipped, and one poll is asked when the mutation ends.
+- The counter bumps when a mutation starts and when it ends. An answer
+  (`threads` or `files`) is dropped if the counter changed since its
+  request started.
+- A dropped answer is asked for again as soon as no mutation is in flight.
+
+### A4. A new thread is not removed by a lagging read
+
+A thread or comment merged from an ok answer is kept until a poll has
+contained its ID, or for 60 seconds, whichever comes first. After that the
+ordinary missing-thread rule applies.
+
+### A5. Typing must not trigger review keys
+
+Today a key reaches a text input only when `filesTyping()` is true, which
+means only the filter (`main.js:980-990`); otherwise it goes to
+`files.key`. So a typed `x` in the composer would resolve a thread.
+
+- The composer's and the dialog body's focus (from the textarea's `focus`
+  and `blur` events) set the same typing flag as the filter, and
+  `filesTyping()` covers them.
+- `files.key` returns early while typing. The tab commands
+  (`github.tab`, `github.backtab`) are swallowed while typing.
+- `files.escape` (`main.js:594-602`) closes the composer first, then the
+  filter, then leaves.
+- Order in `files.key`: the typing check, then the held check
+  (`files.js:334-335`), then the new keys, then the state check.
+- Test: with the composer focused, `x`, `shift-d`, `shift-s`, `1` and the
+  tab commands change nothing but the text.
+
+### A6. Submit with no `reviewId`, and its unknown outcome
+
+- Unknown outcome **with** `reviewId`: if a poll started after the send
+  ended shows that review no longer pending, say "Your pending review is
+  no longer pending" and treat it as sent.
+- Unknown outcome **without** `reviewId`: "the pending review is gone"
+  proves nothing, because there was none. Only a review by the viewer in
+  the submitted state, submitted after the send started (read with
+  `reviews(author: viewer, last: 1)`), counts. Otherwise "Could not
+  confirm".
+- Accepted risk, stated: between the binary's read and the mutation there
+  is a window GitHub gives no way to close. Comparing `count` also misses
+  one comment deleted and another added. The dialog's read-and-compare
+  narrows the window; it does not remove it.
+- Add to Verify first: what `addPullRequestReview` with an `event` does
+  when a pending review already exists (refuses, leaves it alone, or
+  publishes its comments). If it can publish comments the dialog did not
+  show, stop and report before building the no-`reviewId` path.
+- "`comment` with no body and no pending comments is refused" means the
+  **event** `comment`, not `do: comment`.
+
+### A7. `comment` with no pending review cannot answer `thread`
+
+`addPullRequestReview`'s payload has the review and no thread. On that
+path the answer carries `comment` and `review` only. The mod shows the
+comment as sent, holds it by A4, and lets the next poll place the thread.
+
+### A8. Reply with no pending review
+
+- The empty pending review is created with `commitOID` set to the head
+  from the pre-read.
+- If the **first** mutation's outcome is unknown: say "No answer. An empty
+  pending review may have been created." and run the reply check. A resend
+  reads again and replies into whatever pending review then exists.
+- If the deadline falls between the two mutations: refused for the reply,
+  with the new `review` in the answer.
+
+### A9. Drafts and head
+
+A send always uses the head the diff is currently loaded at, and the row
+must exist there with the same text. Otherwise the draft is unplaced and
+cannot be sent. This holds for a composer left open across a reload.
+
+### A10. Smaller points
+
+- The new `do` values branch before the demo save at `app.go:356`. The new
+  branch saves demo state itself, as `appFilesOp` does for `viewed`
+  (`app.go:415`).
+- The test harness: the pure modules are ESM in `.js` files and there is
+  no `package.json`. Either add `app/mods/github/package.json` with
+  `{"type": "module"}` (check `herdr-app check` and the installer ignore
+  it) or pin Node 22.12 or later in `setup-node`. Agree the choice with
+  the Instant open tab's harness.
+- Whether the virtual list's render callback exposes the visible item
+  range is unverified. If it does not, say so and propose how the scroll
+  anchor is kept.
