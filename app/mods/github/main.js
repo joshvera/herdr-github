@@ -22,19 +22,20 @@ import { FilesView } from "./files.js";
 // to herdr-plugin.toml's version).
 export const GITHUB_VERSION = "0.11.0";
 
-// Puts that release on a machine, once: into a folder of its own version, so
-// it never touches a herdr-github installed for the TUI. The archive for the
-// machine's system is checked against the release's checksums before it's
-// used. Prints the binary's path.
+// Puts that release on a machine, once: from this fork's releases, into a
+// folder of the fork's own version (joshvera-<version>), so it never touches
+// a herdr-github installed for the TUI, nor mistakes an upstream build of the
+// same version for its own. The archive for the machine's system is checked
+// against the release's checksums before it's used. Prints the binary's path.
 const PROVISION = String.raw`
 v=$1
-dest="$HOME/.local/share/herdr-github/app/$v"
+dest="$HOME/.local/share/herdr-github/app/joshvera-$v"
 bin="$dest/herdr-github"
 [ -x "$bin" ] && { printf '%s' "$bin"; exit 0; }
 case "$(uname -s)" in Darwin) os=darwin ;; Linux) os=linux ;; *) echo "no herdr-github for $(uname -s)" >&2; exit 1 ;; esac
 case "$(uname -m)" in x86_64|amd64) arch=amd64 ;; arm64|aarch64) arch=arm64 ;; *) echo "no herdr-github for $(uname -m)" >&2; exit 1 ;; esac
 name="herdr-github_$v""_$os""_$arch.tar.gz"
-url="https://github.com/mrolafsson/herdr-github/releases/download/v$v"
+url="https://github.com/joshvera/herdr-github/releases/download/v$v"
 tmp=$(mktemp -d) || exit 1
 trap 'rm -rf "$tmp"' EXIT
 curl -fsSL "$url/$name" -o "$tmp/$name" && curl -fsSL "$url/checksums.txt" -o "$tmp/sums" || { echo "couldn't download herdr-github $v" >&2; exit 1; }
