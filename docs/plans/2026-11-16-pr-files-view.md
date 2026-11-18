@@ -200,3 +200,10 @@ Minor). Accepted unless noted. These override the decisions above.
 - **M1.** Thread blocks: estimated height from wrapped text at the list's
   measured width for open threads, one line for folded ones; the builder
   may cap long ones with "enter for all".
+
+## Ruling after the final review
+
+- **I6 holds per view, not per head.** Reopening the same PR while its
+  first `files` is still out can run a second load for that head. That
+  costs one duplicate read and never mixes data. Sharing in-flight loads
+  across views would add machinery for a rare path.
