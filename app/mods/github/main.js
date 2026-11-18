@@ -12,13 +12,13 @@
 import { View, div } from "gpui-kit";
 import * as fs from "fs/promises";
 import { v_flex, h_flex, InputState, Input, TextView, Scrollbar, v_virtual_list, VirtualListScrollHandle, ScrollHandle } from "gpui-base";
-import { agents, panes, machines, spaces, run, exec, theme, appHome, props, closeOverlay, openOverlay, nextCommand, knownAgents } from "herdr";
+import { agents, panes, machines, spaces, run, exec, theme, appHome, props, closeOverlay, openOverlay, nextCommand, knownAgents, checking } from "herdr";
 import { demoAgents, DEMO_REPO } from "./demo.js";
 import { tones, tint, countPill, groupOf, toneColor, prLook, checkLook, ago, icon, chip, words, key, cap, MONO } from "./look.js";
 import { PR_TABS, tabFor, prRoute } from "./prkeys.js";
 import { FilesView } from "./files.js";
 import { Store } from "./store.js";
-import { whoOf, sameWho, empty, seed, listPatch, resolveRepo, pickedRepo, staleMark, stamper } from "./cache.js";
+import { whoOf, sameWho, empty, seed, listPatch, resolveRepo, pickedRepo, staleMark, stamper, takesOver, canAct } from "./cache.js";
 
 // The herdr-github this mod is part of (its release; the repo's tests hold it
 // to herdr-plugin.toml's version).
@@ -226,6 +226,10 @@ export default class GitHub extends View {
     this.at = 0;
     this.cur = null; // the PR open, as listed
     this.detail = null;
+    // What's shown in `detail`: when its request was sent (`at`), whether
+    // it's from the cache (`cached`: nothing may act on it), and why its
+    // refresh failed (`error`).
+    this.detailInfo = null;
     this.prTab = "overview"; // the PR screen's tab (PR_TABS)
     this.menu = null;
     this.parked = null; // a menu that came while Overview wasn't shown
@@ -298,6 +302,10 @@ export default class GitHub extends View {
       cx.notify();
     });
     cx.timer.every(60000, (cx) => this.screen === "list" && !this.busy && this.loadAll(cx));
+    // The row the cursor rests on: its detail, fetched ahead (warm).
+    this.rest = null;
+    this.warming = false;
+    cx.timer.every(200, (cx) => this.warmTick(cx));
 
     // Key bindings and `herdr-app do`: github.escape, github.tab,
     // github.backtab, github.demo, github.next, github.prev, github.reload.
@@ -385,7 +393,7 @@ export default class GitHub extends View {
     this.gen++;
     this.lists = {};
     this.cache = empty("lists", this.who);
-    this.forgetDetail?.();
+    this.forgetDetail();
   }
 
   // One request where gh is signed in; `opts` go to exec (see ask).
@@ -675,6 +683,7 @@ export default class GitHub extends View {
     this.screen = "pr";
     this.cur = pr;
     this.detail = null;
+    this.detailInfo = null;
     this.prTab = "overview";
     this.menu = this.parked = null;
     this.checkAt = 0;
@@ -682,6 +691,7 @@ export default class GitHub extends View {
     this.err = this.flash = "";
     this.direct = direct;
     this.loadDetail(cx);
+    this.showCachedDetail(pr, cx);
     this.loadSessions(cx);
     cx.timer.after(30, () => this.keys.focus());
     cx.notify();
@@ -689,17 +699,98 @@ export default class GitHub extends View {
 
   loadDetail(cx) {
     const pr = this.cur;
+    const at = this.stamp();
+    const gen = this.gen;
     cx.spawn(async (cx) => {
       try {
         const d = await this.gh({ op: "detail", pr: prID(pr) });
-        if (this.cur?.key !== pr.key) return;
-        this.detail = d;
+        if (gen !== this.gen) return;
+        this.keepDetail(pr.key, d, at);
+        if (!this.showDetail(pr.key, d, { at, cached: false })) return;
         this.cur = { ...pr, ...d };
         this.replaceRow(d);
       } catch (e) {
-        if (this.cur?.key === pr.key) this.err = String(e?.message ?? e);
+        if (this.cur?.key !== pr.key) return;
+        this.err = String(e?.message ?? e);
+        // A cached Overview stays, marked with why and how old; r tries again.
+        if (this.detailInfo?.cached) this.detailInfo.error = this.err;
       }
       cx.notify();
+    });
+  }
+
+  // `d`, as the detail of the PR open (`key`), if it may replace what's
+  // shown (cache.js takesOver): whether it did. Only the detail and what's
+  // known about it change, never the tab, the chosen check or the scroll.
+  showDetail(key, d, info) {
+    if (this.screen !== "pr" || this.cur?.key !== key || !takesOver(this.detailInfo, info)) return false;
+    this.detail = d;
+    this.detailInfo = { at: info.at, cached: info.cached, error: "" };
+    return true;
+  }
+
+  // The Overview kept from last time (or warmed), shown at once while the
+  // fresh one is asked for. Only if it's the shown account's.
+  showCachedDetail(pr, cx) {
+    if (this.demo) return;
+    const gen = this.gen;
+    cx.spawn(async (cx) => {
+      const doc = await this.store.read("details");
+      const e = doc.details[pr.key];
+      if (!e?.d || gen !== this.gen || !sameWho(doc.who, this.cachedWho())) return;
+      if (this.showDetail(pr.key, e.d, { at: e.saved, cached: true })) cx.notify();
+    });
+  }
+
+  keepDetail(key, d, at) {
+    this.persist("details", { details: { [key]: { d, saved: at } } });
+  }
+
+  // An Overview from the cache, gone with the account it was from.
+  forgetDetail() {
+    if (!this.detailInfo?.cached) return;
+    this.detail = null;
+    this.detailInfo = null;
+  }
+
+  // Whether the PR shown may be acted on: never from a cached Overview (its
+  // fields may be stale, and choices are built from them). Says why not.
+  mayAct(cx) {
+    if (canAct(this.detail && { d: this.detail, ...this.detailInfo })) return true;
+    this.say(this.detail ? "Refreshing…" : "Still loading…", cx);
+    return false;
+  }
+
+  // Every 200 ms: once the cursor has rested 400 ms on a row whose detail
+  // isn't cached from the last 2 minutes, fetch it into the cache, one at a
+  // time. It touches the screen only as a cached Overview (showDetail), and
+  // never a list row.
+  warmTick(cx) {
+    if (this.demo || checking() || this.screen !== "list" || this.warming || !this.who) return;
+    const pr = this.shown?.[this.at];
+    if (this.rest?.key !== pr?.key) {
+      this.rest = pr ? { key: pr.key, since: Date.now(), done: false } : null;
+      return;
+    }
+    if (!this.rest || this.rest.done || Date.now() - this.rest.since < 400) return;
+    this.rest.done = true;
+    this.warming = true;
+    const gen = this.gen;
+    cx.spawn(async (cx) => {
+      try {
+        const doc = await this.store.read("details");
+        const e = doc.details[pr.key];
+        if (e && Date.now() - e.saved < 120000 && sameWho(doc.who, this.who)) return;
+        const at = this.stamp();
+        const d = await this.gh({ op: "detail", pr: prID(pr) });
+        if (gen !== this.gen) return;
+        this.keepDetail(pr.key, d, at);
+        if (this.showDetail(pr.key, d, { at, cached: true })) cx.notify();
+      } catch {
+        // Warming is a convenience: opening the PR asks again.
+      } finally {
+        this.warming = false;
+      }
     });
   }
 
@@ -820,6 +911,7 @@ export default class GitHub extends View {
   // change to a PR at a time: a second d sent before the first answers
   // reads the draft state the first is changing.
   act(what, label, cx, after) {
+    if (!this.mayAct(cx)) return;
     const pr = this.cur;
     if (this.acting.has(pr.key)) return this.say(`#${pr.number} is still changing: one change at a time.`, cx);
     this.acting.add(pr.key);
@@ -847,16 +939,16 @@ export default class GitHub extends View {
   }
 
   toggleDraft(cx) {
+    if (!this.mayAct(cx)) return;
     const d = this.detail;
-    if (!d) return this.say("Still loading…", cx);
     if (d.state !== "OPEN") return this.say(`#${d.number} is already ${d.state.toLowerCase()}.`, cx, true);
     this.act({ do: d.draft ? "ready" : "draft" }, d.draft ? "Marking it ready for review…" : "Making it a draft…", cx);
   }
 
   // The merge menu: herdr-github's choices; a confirmation for those that ask.
   mergeMenu(cx) {
+    if (!this.mayAct(cx)) return;
     const d = this.detail;
-    if (!d) return this.say("Still loading…", cx);
     if (d.mergeWhy) return this.say(d.mergeWhy.replace("mark it ready for review", "press d to mark it ready for review"), cx, true);
     const items = d.merge.map((c) => ({
       label: c.label,
@@ -873,6 +965,7 @@ export default class GitHub extends View {
   // After a merge of `pr` (the PR shown): delete its branch on GitHub,
   // remove its worktree.
   cleanupMenu(pr, cx) {
+    if (!this.mayAct(cx)) return;
     const d = this.detail;
     const tree = this.treeOf(pr);
     const canDelete = d?.cleanup?.deleteBranch;
@@ -1453,6 +1546,8 @@ export default class GitHub extends View {
   prView(o) {
     const pr = this.cur;
     const d = this.detail;
+    const info = this.detailInfo;
+    const mark = staleMark(Boolean(info?.cached), info?.at, info?.error ?? "");
     const look = prLook(o, pr);
     const stateWord = pr.state === "MERGED" ? "Merged" : pr.state === "CLOSED" ? "Closed" : pr.draft ? "Draft" : pr.state ? "Open" : "";
     const now = Date.now();
@@ -1470,7 +1565,8 @@ export default class GitHub extends View {
           .child(div().font_family(MONO).text_size(12.5).text_color(o.muted).child(`#${pr.number}`))
           .child(div().text_size(12.5).text_color(o.dim).child(pr.repo))
           .child(div().flex_1())
-          .when(Boolean(pr.updated), (el) => el.child(div().text_size(12).text_color(o.dim).child(`updated ${ago(pr.updated, now)}`))),
+          .when(Boolean(mark), (el) => el.child(div().flex_none().text_size(12).text_color(info?.error ? o.fix : o.dim).child(mark)))
+          .when(Boolean(pr.updated) && !mark, (el) => el.child(div().text_size(12).text_color(o.dim).child(`updated ${ago(pr.updated, now)}`))),
       )
       .child(div().flex_none().text_size(17).font_semibold().text_color(o.fg).line_height(1.35).child(pr.title))
       .when(Boolean(d), (el) => el.child(
