@@ -28,6 +28,7 @@ import { icon, MONO } from "./look.js";
 import { treeRows, matchesPath, statusMark } from "./filetree.js";
 import { diffItems } from "./diffitems.js";
 import { TREE_ROW_H, treeRow, viewedMark, diffItem } from "./filesdraw.js";
+import { mergeThreads, countThreads, refind, shiftedAbove, PollHealth } from "./follow.js";
 
 const TREE_W = 290;
 const FILTER_H = 30;
@@ -35,6 +36,11 @@ const SUMMARY_H = 18;
 const FILE_HEAD_H = 30;
 const NOTE_H = 22;
 const GAP = 6;
+
+// How often the open PR is read again while the tab shows (spec: Following
+// the PR).
+const POLL_MS = 15000;
+const NEW_COMMITS = "New commits pushed. r reloads.";
 
 // `files` and `diff` can take a while on a big PR (every REST page).
 const SLOW = { timeout: 120000 };
@@ -48,7 +54,7 @@ const MOVES = new Set(["j", "k", "down", "up", "]", "[", "n", "p"]);
 const SAME_PRESS_MS = 150;
 
 // An older herdr-github, from before these ops.
-const TOO_OLD = /no op "(files|diff)"/;
+const TOO_OLD = /no op "(files|diff|threads)"/;
 
 const said = (e) => String(e?.message ?? e);
 // The last index of `xs` where `ok` holds, or -1.
@@ -81,7 +87,15 @@ export class FilesView {
     this.diffs = new Map(); // path → `diff`'s answer, for data.head
     this.failed = new Map(); // path → why its diff didn't come, until r
     this.asking = null; // the one diff request out
-    this.staleHead = null; // the head a stale diff already reloaded for
+    this.behind = false; // GitHub has a newer head than the one shown, until r
+    this.review = null; // the viewer's pending review, from the last files or threads
+    this.prInfo = null; // files' pr: id, mine, state; no id means an older herdr-github
+    this.polling = false; // the one threads poll out
+    this.pollAt = 0; // when the next poll is due
+    this.health = new PollHealth();
+    this.held = new Map(); // id → until: sent from here, not yet read back (follow.js)
+    this.topKey = null; // the first item the diff list drew: the scroll's anchor
+    this.filesOwed = false; // a files answer was dropped: read again once nothing is sent
     this.path = null; // the open file
     this.at = 0; // the cursor: an index into items()
     this.target = null; // where the cursor goes once the open file's items come
@@ -199,14 +213,16 @@ export class FilesView {
   // The tab came into view: its files, the first time.
   shown(cx) {
     if (this.state === "idle") this.loadFiles(cx);
-    else this.pump(cx);
+    else {
+      this.pump(cx);
+      this.poll(cx);
+    }
   }
 
   // r: the files again, and the open file's diff; errors forgotten.
   reload(cx) {
     this.failed.clear();
     if (this.path) this.diffs.delete(this.path);
-    this.staleHead = null;
     if (this.state === "old" || this.state === "error") this.state = "idle";
     this.loadFiles(cx);
   }
@@ -223,6 +239,7 @@ export class FilesView {
     this.reading = true;
     if (!this.data) this.state = "loading";
     cx.notify();
+    const gen = this.app.gate.gen;
     cx.spawn(async (cx) => {
       let res;
       try {
@@ -246,14 +263,23 @@ export class FilesView {
       }
       if (!this.alive()) return;
       this.reading = false;
+      if (gen !== this.app.gate.gen && this.data) {
+        // A change was sent meanwhile: this picture may be from before it.
+        this.filesOwed = true;
+        return cx.notify();
+      }
       if (this.data?.head !== res.head) {
         this.diffs.clear();
         this.failed.clear();
         this.asking = null; // an answer for the old head is let go
       }
       this.data = { head: res.head, files: res.files ?? [], threads: res.threads ?? [], more: Boolean(res.more) };
-      this.byPath = new Map();
-      for (const t of this.data.threads) this.byPath.set(t.path, [...(this.byPath.get(t.path) ?? []), t]);
+      this.indexThreads();
+      this.review = res.review ?? null;
+      this.prInfo = res.pr ?? null;
+      this.behind = false;
+      this.health.ok();
+      this.pollAt = Date.now() + POLL_MS;
       this.state = "ok";
       if (!this.file()) {
         this.path = this.order()[0]?.path ?? this.data.files[0]?.path ?? null;
@@ -308,17 +334,89 @@ export class FilesView {
     });
   }
 
-  // GitHub answered a diff for a newer head than `files` said: read the
-  // files again. A second time for the same head means its two answers
-  // disagree (REST can lag GraphQL); that waits for r rather than go round.
+  // GitHub has a newer head than the one shown. Nothing reloads by itself
+  // (it would move what's being read): the notice says so, and r reloads.
   stale(path, head, cx) {
-    if (this.staleHead === head) {
-      this.failed.set(path, "GitHub answered this file for another commit than its list of files. r tries again.");
-      this.pump(cx);
-      return cx.notify();
+    this.behind = true;
+    this.failed.set(path, NEW_COMMITS);
+    this.pump(cx);
+    cx.notify();
+  }
+
+  // ── following the PR ─────────────────────────────────────────────────
+
+  indexThreads() {
+    this.byPath = new Map();
+    for (const t of this.data.threads) this.byPath.set(t.path, [...(this.byPath.get(t.path) ?? []), t]);
+  }
+
+  // Whether this herdr-github can follow the PR and take review actions.
+  follows() {
+    return Boolean(this.prInfo?.id);
+  }
+
+  // main's timer, every second while the popup is open: a poll when one is
+  // due or owed, only while this tab is the one shown.
+  tick(cx) {
+    if (!this.alive() || this.app.screen !== "pr" || this.app.prTab !== "files") return;
+    if (this.filesOwed && this.app.gate.clear() && !this.reading) {
+      this.filesOwed = false;
+      return this.loadFiles(cx);
     }
-    this.staleHead = head;
-    this.loadFiles(cx, "The PR has new commits: its files are read again.");
+    if (this.app.gate.takeOwed() || Date.now() >= this.pollAt) this.poll(cx);
+  }
+
+  // Reads the PR's threads and pending review (`threads`), one at a time.
+  poll(cx) {
+    if (!this.alive() || this.state !== "ok" || !this.follows() || this.polling || this.reading) return;
+    const stamp = this.app.gate.startPoll();
+    if (stamp === null) return; // a change is out: asked again when it ends
+    this.polling = true;
+    this.pollAt = Date.now() + POLL_MS;
+    const head = this.data.head;
+    cx.spawn(async (cx) => {
+      let res = null;
+      let err = null;
+      try {
+        res = await this.app.gh({ op: "threads", pr: this.prID() });
+      } catch (e) {
+        err = e;
+      }
+      if (!this.alive()) return;
+      this.polling = false;
+      this.pollAt = Date.now() + POLL_MS;
+      if (err) {
+        if (TOO_OLD.test(said(err))) this.prInfo = null; // stops following; the rest works
+        else this.health.failed(said(err));
+        return cx.notify();
+      }
+      // Older than a change sent since it started: dropped, asked again.
+      if (!this.app.gate.fresh(stamp)) return;
+      this.health.ok();
+      if (this.data?.head !== head) return; // r read another head meanwhile
+      this.applyThreads(res);
+      cx.notify();
+    });
+  }
+
+  // A `threads` answer into what's shown, moving nothing being read.
+  applyThreads(res) {
+    this.review = res.review ?? null;
+    if (res.pr) this.prInfo = res.pr;
+    if (res.head !== this.data.head) {
+      this.behind = true;
+      return;
+    }
+    const before = this.items();
+    const top = before ? Math.max(0, before.findIndex((it) => it.key === this.topKey)) : 0;
+    const { threads, held } = mergeThreads(this.data.threads, res, this.held, Date.now());
+    this.held = held;
+    this.data = { ...this.data, threads, files: countThreads(this.data.files, threads), more: this.data.more || Boolean(res.more) };
+    this.indexThreads();
+    const after = this.items();
+    if (!before || !after) return;
+    this.at = refind(before, after, this.at);
+    if (shiftedAbove(before, after, top)) this.ui.diffScroll.scroll_to_item(refind(before, after, top), "top");
   }
 
   // ── keys ───────────────────────────────────────────────────────────────
@@ -534,7 +632,10 @@ export class FilesView {
       } else {
         if (f.viewed === to) f.viewed = was;
         if (r.kind === "unknown") this.say(`No answer about ${f.path}. r shows whether it was marked.`, cx, true);
-        else if (r.answer?.stale === true) this.loadFiles(cx, `The PR has new commits, so ${f.path} wasn't marked: its files are read again.`);
+        else if (r.answer?.stale === true) {
+          this.behind = true;
+          this.say(`${NEW_COMMITS} ${f.path} wasn't marked.`, cx, true);
+        }
         else this.say(r.error, cx, true);
       }
       cx.notify();
@@ -664,6 +765,8 @@ export class FilesView {
     const d = this.diffs.get(f.path);
     const notes = [];
     const failed = this.failed.get(f.path);
+    if (this.behind && failed !== NEW_COMMITS) notes.push(this.note(o, NEW_COMMITS, o.work));
+    if (this.health.error) notes.push(this.note(o, `Couldn't follow the PR: ${this.health.error}`));
     if (!items) notes.push(this.note(o, "Loading its diff…"));
     else if (failed) notes.push(this.note(o, `${failed}${/r tries again/.test(failed) ? "" : " r tries again."}`, o.fix));
     else if (d.state === "binary") notes.push(this.note(o, "A binary file: no text diff."));
@@ -682,7 +785,10 @@ export class FilesView {
             }
           })
           .child(v_virtual_list("gh-diff", items.length, items.map((it) => it.h), (i) => items[i].key,
-            (range) => items.slice(range.start, range.end).map((it, n) => this.safe(() => diffItem(o, it, range.start + n === this.at), it.h, it.row?.text ?? it.text ?? "")))
+            (range) => {
+              this.topKey = items[range.start]?.key ?? null; // the scroll's anchor for a merge
+              return items.slice(range.start, range.end).map((it, n) => this.safe(() => diffItem(o, it, range.start + n === this.at), it.h, it.row?.text ?? it.text ?? ""));
+            })
             .track_scroll(this.ui.diffScroll).size_full()
             .on_item_click((key, cx) => {
               const i = items.findIndex((x) => x.key === key);

@@ -18,6 +18,7 @@ import { tones, tint, countPill, groupOf, toneColor, prLook, checkLook, ago, ico
 import { PR_TABS, tabFor, prRoute } from "./prkeys.js";
 import { FilesView } from "./files.js";
 import { sendOnce, MutationGate, MUTATION_TIMEOUT } from "./mutation.js";
+import { reviewChip } from "./follow.js";
 
 // The herdr-github this mod is part of (its release; the repo's tests hold it
 // to herdr-plugin.toml's version).
@@ -283,6 +284,8 @@ export default class GitHub extends View {
       cx.notify();
     });
     cx.timer.every(60000, (cx) => this.screen === "list" && !this.busy && this.loadAll(cx));
+    // The open PR's Files tab follows it (files.js decides when to read).
+    cx.timer.every(1000, (cx) => this.files?.tick(cx));
 
     // Key bindings and `herdr-app do`: github.escape, github.tab,
     // github.backtab, github.demo, github.next, github.prev, github.reload.
@@ -1326,6 +1329,8 @@ export default class GitHub extends View {
     const now = Date.now();
     const from = this.direct && this.backTo?.label ? this.backTo.label : this.direct && this.from === "recap" ? "Recap" : this.tabLabel(TABS.find((x) => x.id === this.tab), true);
     const body = this.prTab === "checks" ? this.checksTab(o) : this.prTab === "files" ? this.files.view(o) : this.overviewTab(o);
+    // The pending review, as the Files tab last read it (absent until it has).
+    const chipText = this.files ? reviewChip(this.files.review, Boolean(this.files.data?.more)) : "";
 
     return v_flex().flex_1().min_h(0).gap(10)
       .child(
@@ -1338,6 +1343,7 @@ export default class GitHub extends View {
           .child(div().font_family(MONO).text_size(12.5).text_color(o.muted).child(`#${pr.number}`))
           .child(div().text_size(12.5).text_color(o.dim).child(pr.repo))
           .child(div().flex_1())
+          .when(Boolean(chipText), (el) => el.child(chip(o, "review", [icon("pr", o.work, 12), chipText], { color: o.work })))
           .when(Boolean(pr.updated), (el) => el.child(div().text_size(12).text_color(o.dim).child(`updated ${ago(pr.updated, now)}`))),
       )
       .child(div().flex_none().text_size(17).font_semibold().text_color(o.fg).line_height(1.35).child(pr.title))
