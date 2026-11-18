@@ -20,7 +20,7 @@ import { FilesView } from "./files.js";
 
 // The herdr-github this mod is part of (its release; the repo's tests hold it
 // to herdr-plugin.toml's version).
-export const GITHUB_VERSION = "0.11.0";
+export const GITHUB_VERSION = "0.11.0-joshvera.1";
 
 // Puts that release on a machine, once: from this fork's releases, into a
 // folder of the fork's own version (joshvera-<version>), so it never touches
