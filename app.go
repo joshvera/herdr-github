@@ -402,7 +402,7 @@ func appAnswer(ctx context.Context, cfg config, req appRequest) (any, error) {
 }
 
 // appFilesOp answers the ops of the Files changed view, and says whether the
-// request was one: files, diff, and act viewed or unviewed. A diff for a head
+// request was one: files, threads, diff, and act viewed or unviewed. A diff for a head
 // that's in the cache answers from it before anything asks GitHub anything
 // (never for the demo, which has no cache and no network).
 func appFilesOp(ctx context.Context, src source, demo *appDemo, req appRequest, r repoRef) (any, bool, error) {
@@ -410,6 +410,9 @@ func appFilesOp(ctx context.Context, src source, demo *appDemo, req appRequest, 
 	switch {
 	case req.Op == "files":
 		out, err := src.files(ctx, r, n)
+		return out, true, err
+	case req.Op == "threads":
+		out, err := src.threads(ctx, r, n)
 		return out, true, err
 	case req.Op == "diff":
 		if err := checkHeadAndPath(req); err != nil {

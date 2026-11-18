@@ -230,7 +230,7 @@ func (d *demoSource) files(_ context.Context, r repoRef, number int) (filesAnswe
 	if p == nil {
 		return filesAnswer{}, fmt.Errorf("%s#%d isn't there", r, number)
 	}
-	out := filesAnswer{Head: p.HeadRefOid, Files: []fileEntry{}, Threads: []fileThread{}}
+	out := filesAnswer{threadsAnswer: d.threadsOf(p), Files: []fileEntry{}}
 	data := d.filesData[p.key()]
 	if data == nil {
 		return out, nil
@@ -248,13 +248,37 @@ func (d *demoSource) files(_ context.Context, r repoRef, number int) (filesAnswe
 		}
 		out.Files = append(out.Files, e)
 	}
+	orderThreads(out.Files, out.Threads)
+	tallyThreads(out.Files, out.Threads)
+	return out, nil
+}
+
+// threads answers the `threads` op on the demo.
+func (d *demoSource) threads(_ context.Context, r repoRef, number int) (threadsAnswer, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	p := d.findRef(r, number)
+	if p == nil {
+		return threadsAnswer{}, fmt.Errorf("%s#%d isn't there", r, number)
+	}
+	out := d.threadsOf(p)
+	orderThreads(nil, out.Threads)
+	return out, nil
+}
+
+// threadsOf is a demo PR's threads (copies), the PR, and the viewer's
+// pending review. Callers hold d.mu.
+func (d *demoSource) threadsOf(p *prDetail) threadsAnswer {
+	out := threadsAnswer{Head: p.HeadRefOid, PR: prInfo{ID: p.ID, Mine: p.author() == d.me, State: strings.ToLower(p.State)}, Threads: []fileThread{}}
+	data := d.filesData[p.key()]
+	if data == nil {
+		return out
+	}
 	for _, t := range data.threads {
 		t.Comments = append([]threadComment{}, t.Comments...)
 		out.Threads = append(out.Threads, t)
 	}
-	orderThreads(out.Files, out.Threads)
-	tallyThreads(out.Files, out.Threads)
-	return out, nil
+	return out
 }
 
 func (d *demoSource) diff(_ context.Context, r repoRef, number int, head, path string) (diffAnswer, error) {

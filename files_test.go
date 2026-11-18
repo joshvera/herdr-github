@@ -27,6 +27,9 @@ type fakePR struct {
 	queries []gqlRequest
 	headQs  int
 	errors  []map[string]any // sent with the data (a partial answer)
+	// What the first page says of the PR and its reviews.
+	mine    bool
+	reviews []map[string]any
 }
 
 func (p *fakePR) handler() http.HandlerFunc {
@@ -59,6 +62,10 @@ func (p *fakePR) handler() http.HandlerFunc {
 				"pageInfo": map[string]any{"hasNextPage": end < len(all), "endCursor": "p" + strconv.Itoa(end)},
 				"nodes":    all[off:end],
 			}
+		}
+		if req.Variables["review"] == true {
+			pr["viewerDidAuthor"], pr["state"] = p.mine, "OPEN"
+			pr["reviews"] = map[string]any{"nodes": append([]map[string]any{}, p.reviews...)}
 		}
 		if req.Variables["files"] == true {
 			pr["files"] = page(p.files, req.Variables["fa"])
@@ -405,5 +412,104 @@ func TestFilesPRThatIsntThere(t *testing.T) {
 	_, err := newClient("github.com").files(ctxBG(), testRepo, 7)
 	if err == nil || !strings.Contains(err.Error(), "o/r#7 isn't there") {
 		t.Fatalf("err %v", err)
+	}
+}
+
+// reviewNode is a review as GraphQL sends it.
+func reviewNode(id, state string, mine bool, comments int, commit string) map[string]any {
+	return map[string]any{"id": id, "body": "overall\nthoughts", "state": state, "viewerDidAuthor": mine,
+		"commit": map[string]any{"oid": commit}, "comments": map[string]any{"totalCount": comments}}
+}
+
+// `files` says whose PR it is, its state, the viewer's pending review and
+// what the viewer may do to each thread and comment.
+func TestFilesCarryTheReviewAndPermissions(t *testing.T) {
+	cacheFixture(t)
+	pr := &fakePR{t: t, head: staticHead(headA), mine: true}
+	pr.reviews = []map[string]any{
+		reviewNode("PRR_other", "PENDING", false, 9, headA), // someone else's: never the viewer's
+		reviewNode("PRR_mine", "PENDING", true, 3, headB),
+	}
+	for i := 0; i < 150; i++ {
+		pr.files = append(pr.files, fileNode(fmt.Sprintf("f%03d", i), "MODIFIED", "UNVIEWED", 1, 1))
+	}
+	c := commentNode("C1", "me", "mine", "PENDING")
+	c["viewerDidAuthor"], c["viewerCanUpdate"], c["viewerCanDelete"] = true, true, true
+	pr.threads = []map[string]any{threadNode("T", "f000", map[string]any{
+		"viewerCanReply": true, "viewerCanResolve": false, "viewerCanUnresolve": true,
+		"comments": map[string]any{"pageInfo": map[string]any{"hasNextPage": false}, "nodes": []any{c, commentNode("C2", "you", "theirs", "SUBMITTED")}},
+	})}
+	fakeGitHubREST(t, pr.handler(), restFilesPages(t, nil, 100, headA, nil))
+	got, err := newClient("github.com").files(ctxBG(), testRepo, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := (prInfo{ID: "PR_x", Mine: true, State: "open"}); got.PR != want {
+		t.Fatalf("pr %+v", got.PR)
+	}
+	if want := (reviewInfo{ID: "PRR_mine", Body: "overall\nthoughts", Comments: 3, Commit: headB}); got.Review == nil || *got.Review != want {
+		t.Fatalf("review %+v", got.Review)
+	}
+	th := got.Threads[0]
+	if !th.CanReply || th.CanResolve || !th.CanUnresolve {
+		t.Fatalf("thread permissions %+v", th)
+	}
+	mine, theirs := th.Comments[0], th.Comments[1]
+	if !mine.Mine || !mine.CanEdit || !mine.CanDelete || theirs.Mine || theirs.CanEdit || theirs.CanDelete {
+		t.Fatalf("comment permissions %+v %+v", mine, theirs)
+	}
+	// The PR and its reviews are asked for on the first page only.
+	if len(pr.queries) != 2 || pr.queries[0].Variables["review"] != true || pr.queries[1].Variables["review"] != false {
+		t.Fatalf("%d queries, review %v", len(pr.queries), pr.queries[0].Variables["review"])
+	}
+}
+
+// No pending review of the viewer's: review is null, not left out.
+func TestFilesWithNoPendingReviewSaysNull(t *testing.T) {
+	cacheFixture(t)
+	pr := &fakePR{t: t, head: staticHead(headA)}
+	pr.reviews = []map[string]any{reviewNode("PRR_sent", "COMMENTED", true, 1, headA)}
+	fakeGitHubREST(t, pr.handler(), restFilesPages(t, nil, 100, headA, nil))
+	got := opRun(t, `{"op":"files",`+opPR+`}`)
+	if v, ok := got["review"]; !ok || v != nil {
+		t.Fatalf("review %v (present %v)", v, ok)
+	}
+	if p := got["pr"].(map[string]any); p["id"] != "PR_x" || p["mine"] != false || p["state"] != "open" {
+		t.Fatalf("pr %v", p)
+	}
+}
+
+// `threads`: the threads, the PR and the pending review, in one GraphQL
+// request, with no files, no REST and no detail query.
+func TestOpThreads(t *testing.T) {
+	cacheFixture(t)
+	pr := &fakePR{t: t, head: staticHead(headA)}
+	pr.reviews = []map[string]any{reviewNode("PRR_mine", "PENDING", true, 2, headA)}
+	pr.files = []map[string]any{fileNode("a.rb", "MODIFIED", "UNVIEWED", 1, 1)}
+	pr.threads = []map[string]any{
+		threadNode("T2", "b.rb", map[string]any{"line": 1, "startLine": 1}),
+		threadNode("T1", "a.rb", map[string]any{"line": 9, "startLine": 9}),
+	}
+	fakeGitHubREST(t, pr.handler(), nil) // any REST request fails the test
+	got := opRun(t, `{"op":"threads",`+opPR+`}`)
+	if _, ok := got["files"]; ok {
+		t.Fatalf("threads answered files: %v", got)
+	}
+	for _, k := range []string{"head", "pr", "review", "threads", "more"} {
+		if _, ok := got[k]; !ok {
+			t.Fatalf("no %s in %v", k, got)
+		}
+	}
+	typed := demoRunAs[threadsAnswer](t, `{"op":"threads",`+opPR+`}`)
+	if typed.Head != headA || typed.Review == nil || typed.Review.ID != "PRR_mine" || len(typed.Threads) != 2 || typed.Threads[0].ID != "T1" {
+		t.Fatalf("%+v", typed)
+	}
+	if len(pr.queries) != 2 || pr.headQs != 0 {
+		t.Fatalf("%d queries, %d head reads", len(pr.queries), pr.headQs)
+	}
+	for _, q := range pr.queries {
+		if q.Variables["files"] != false || strings.Contains(q.Query, "mergeStateStatus") {
+			t.Fatalf("asked for files or the detail: %v", q.Variables)
+		}
 	}
 }
