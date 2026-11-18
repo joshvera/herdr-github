@@ -32,7 +32,7 @@ you're on:
 
 A popup mod (`mod.json`: an overlay popup at the top, 80% of the window),
 opened with ⌘G. It's the Herdr app's side of
-[herdr-github](https://github.com/mrolafsson/herdr-github), whose code does
+[herdr-github](https://github.com/joshvera/herdr-github), whose code does
 the work.
 
 ## Installing it (for the agent adding it)

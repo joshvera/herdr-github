@@ -6,13 +6,13 @@
 #   sh install.sh --app    the Herdr app's GitHub mod
 #
 # From anywhere, in one line:
-#   curl -fsSL https://raw.githubusercontent.com/mrolafsson/herdr-github/main/install.sh | sh -s -- --app
+#   curl -fsSL https://raw.githubusercontent.com/joshvera/herdr-github/main/install.sh | sh -s -- --app
 #
 # The app's mod needs nothing else installed but gh, signed in: it fetches the
 # herdr-github it's part of onto each machine it works on the first time,
 # checked against the release's checksums.
 set -eu
-REPO=mrolafsson/herdr-github
+REPO=joshvera/herdr-github
 
 tui() {
 	command -v herdr >/dev/null 2>&1 || { echo "herdr isn't installed: https://herdr.dev" >&2; return 1; }
