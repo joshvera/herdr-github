@@ -28,8 +28,9 @@ type fakePR struct {
 	headQs  int
 	errors  []map[string]any // sent with the data (a partial answer)
 	// What the first page says of the PR and its reviews.
-	mine    bool
-	reviews []map[string]any
+	mine      bool
+	reviews   []map[string]any
+	submitted []map[string]any // what reviews(last: 10) says
 }
 
 func (p *fakePR) handler() http.HandlerFunc {
@@ -66,6 +67,7 @@ func (p *fakePR) handler() http.HandlerFunc {
 		if req.Variables["review"] == true {
 			pr["viewerDidAuthor"], pr["state"] = p.mine, "OPEN"
 			pr["reviews"] = map[string]any{"nodes": append([]map[string]any{}, p.reviews...)}
+			pr["submitted"] = map[string]any{"nodes": append([]map[string]any{}, p.submitted...)}
 		}
 		if req.Variables["files"] == true {
 			pr["files"] = page(p.files, req.Variables["fa"])
@@ -511,5 +513,40 @@ func TestOpThreads(t *testing.T) {
 		if q.Variables["files"] != false || strings.Contains(q.Query, "mergeStateStatus") {
 			t.Fatalf("asked for files or the detail: %v", q.Variables)
 		}
+	}
+}
+
+// submittedNode is a review as the `submitted` read sends it.
+func submittedNode(id, state string, mine bool, at any) map[string]any {
+	return map[string]any{"id": id, "state": state, "viewerDidAuthor": mine, "submittedAt": at}
+}
+
+// `threads` carries the viewer's latest submitted review (A6): not someone
+// else's, not the pending one, the latest by when it was submitted; null
+// when there's none. It's read on the first page, under its own alias.
+func TestThreadsCarryTheViewersLatestSubmittedReview(t *testing.T) {
+	cacheFixture(t)
+	pr := &fakePR{t: t, head: staticHead(headA)}
+	pr.submitted = []map[string]any{
+		submittedNode("PRR_late", "APPROVED", true, "2026-11-19T10:00:05Z"),
+		submittedNode("PRR_early", "COMMENTED", true, "2026-11-19T10:00:00Z"),
+		submittedNode("PRR_theirs", "CHANGES_REQUESTED", false, "2026-11-19T11:00:00Z"),
+		submittedNode("PRR_pending", "PENDING", true, nil),
+	}
+	fakeGitHubREST(t, pr.handler(), nil)
+	got := demoRunAs[threadsAnswer](t, `{"op":"threads",`+opPR+`}`)
+	want := submittedInfo{ID: "PRR_late", State: "approved", At: time.Date(2026, 11, 19, 10, 0, 5, 0, time.UTC).UnixMilli()}
+	if got.Submitted == nil || *got.Submitted != want {
+		t.Fatalf("submitted %+v", got.Submitted)
+	}
+	q := pr.queries[0].Query
+	if !strings.Contains(q, "submitted: reviews(last: 10) @include(if: $review) {") {
+		t.Fatalf("the submitted read isn't aliased, or its directive isn't before its braces:\n%s", q)
+	}
+
+	pr.submitted = []map[string]any{submittedNode("PRR_pending", "PENDING", true, nil), submittedNode("PRR_theirs", "COMMENTED", false, "2026-11-19T11:00:00Z")}
+	raw := opRun(t, `{"op":"threads",`+opPR+`}`)
+	if v, ok := raw["submitted"]; !ok || v != nil {
+		t.Fatalf("submitted %v (present %v)", v, ok)
 	}
 }

@@ -34,11 +34,15 @@ type demoReview struct {
 
 // demoReviewSave is a PR's review state as appDemo keeps it.
 type demoReviewSave struct {
-	Threads []fileThread `json:"threads"`
-	Pending *demoReview  `json:"pending"`
-	NextID  int          `json:"nextId"`
-	Drafted int          `json:"drafted"`
+	Threads   []fileThread   `json:"threads"`
+	Pending   *demoReview    `json:"pending"`
+	NextID    int            `json:"nextId"`
+	Drafted   int            `json:"drafted"`
+	Submitted *submittedInfo `json:"submitted,omitempty"`
 }
+
+// demoSubmittedStates are the states a submitted review is in, by event.
+var demoSubmittedStates = map[string]string{"COMMENT": "commented", "APPROVE": "approved", "REQUEST_CHANGES": "changes_requested"}
 
 // demoDrafts arrive in Sam's pending review on #482, one per `threads` poll.
 var demoDrafts = []newThread{
@@ -133,6 +137,7 @@ func (d *demoSource) threadsOf(p *prDetail) threadsAnswer {
 		out.Threads = append(out.Threads, d.shownThread(t))
 	}
 	out.Review = data.pendingInfo()
+	out.Submitted = data.submitted
 	return out
 }
 
@@ -398,6 +403,7 @@ func (d *demoSource) submitReview(_ context.Context, r repoRef, number int, revi
 		}
 	}
 	data.review = nil
+	data.submitted = &submittedInfo{ID: reviewID, State: demoSubmittedStates[event], At: nowFn().UnixMilli()}
 	d.changed = true
 	return p.URL + "#pullrequestreview-" + reviewID, outcome
 }
@@ -419,8 +425,10 @@ func (d *demoSource) publishReview(_ context.Context, r repoRef, number int, _, 
 	if !apply {
 		return "", outcome
 	}
+	id := data.newID("PRR", number)
+	data.submitted = &submittedInfo{ID: id, State: demoSubmittedStates[event], At: nowFn().UnixMilli()}
 	d.changed = true
-	return p.URL + "#pullrequestreview-" + data.newID("PRR", number), outcome
+	return p.URL + "#pullrequestreview-" + id, outcome
 }
 
 func (d *demoSource) discardReview(_ context.Context, r repoRef, number int, reviewID string) error {
@@ -454,7 +462,7 @@ func (d *demoSource) discardReview(_ context.Context, r repoRef, number int, rev
 
 // saveReview and loadReview carry a PR's review state through app-demo.json.
 func (data *demoPRFiles) saveReview() *demoReviewSave {
-	return &demoReviewSave{Threads: data.threads, Pending: data.review, NextID: data.nextID, Drafted: data.drafted}
+	return &demoReviewSave{Threads: data.threads, Pending: data.review, NextID: data.nextID, Drafted: data.drafted, Submitted: data.submitted}
 }
 
 func (data *demoPRFiles) loadReview(s *demoReviewSave) {
@@ -462,5 +470,5 @@ func (data *demoPRFiles) loadReview(s *demoReviewSave) {
 	if data.threads == nil {
 		data.threads = []fileThread{}
 	}
-	data.review, data.nextID, data.drafted = s.Pending, s.NextID, s.Drafted
+	data.review, data.nextID, data.drafted, data.submitted = s.Pending, s.NextID, s.Drafted, s.Submitted
 }

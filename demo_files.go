@@ -30,6 +30,8 @@ type demoPRFiles struct {
 	review  *demoReview
 	nextID  int
 	drafted int
+	// The viewer's latest submitted review, once one is (nil before).
+	submitted *submittedInfo
 }
 
 // patch builds a unified patch from hunks: each is its header's start lines

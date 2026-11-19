@@ -84,9 +84,23 @@ filters on `viewerDidAuthor` and `submittedAt`.
 "review": { "id": "PRR_...", "body": "", "comments": 7, "commit": "<oid>" }
 ```
 
-`review` is `null` when there is none. Each thread adds `canReply`,
+```json
+"submitted": { "id": "PRR_...", "state": "approved", "at": 1795024345000 }
+```
+
+`review` is `null` when there is none. `submitted` is the viewer's latest
+submitted review on the PR (`state` is `commented`, `approved`,
+`changes_requested` or `dismissed`; `at` is GitHub's `submittedAt` in ms
+since the epoch), or `null`. It is read on the first page as
+`submitted: reviews(last: 10)`, filtered on `viewerDidAuthor` and a
+non-null `submittedAt` (confirmed on PR #2: the aliased read answers). The
+mod uses it for A6: an unknown submit with no `reviewId` went through when
+a poll started after the send ended shows a `submitted.id` other than the
+one known before the send, with `at` no earlier than the send's start less
+60 s (GitHub's clock is not the mod's). Each thread adds `canReply`,
 `canResolve`, `canUnresolve`; each comment adds `mine`, `canEdit`,
-`canDelete`. `threads` answers `head`, `pr`, `review`, `threads`, `more`.
+`canDelete`. `threads` answers `head`, `pr`, `review`, `submitted`,
+`threads`, `more`.
 
 `act` answers, on ok (always `"ok": true`):
 

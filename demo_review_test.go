@@ -283,3 +283,42 @@ func TestAppDemoSavesOnlyAChange(t *testing.T) {
 		t.Fatalf("a change wasn't saved: %v", err)
 	}
 }
+
+// A submit records the viewer's submitted review, which `threads` then
+// carries, in a later process too; so does one that went through without an
+// answer ("!unknown-sent"), and one that didn't ("!unknown") records nothing.
+func TestAppDemoSubmittedReview(t *testing.T) {
+	t.Setenv("HERDR_PLUGIN_STATE_DIR", t.TempDir())
+	threads := func(pr string) threadsAnswer {
+		return demoRunAs[threadsAnswer](t, `{"op":"threads","demo":true,`+pr+`}`)
+	}
+	if got := threads(demoPR480); got.Submitted != nil {
+		t.Fatalf("submitted before any submit: %+v", got.Submitted)
+	}
+	appRun(t, demoDo(demoPR480, "discard", map[string]any{"reviewId": "PRR_demo_480", "count": 1}))
+	if got := appRun(t, demoDo(demoPR480, "submit", map[string]any{"event": "approve", "body": demoUnknown})); got["unknown"] != true {
+		t.Fatalf("%v", got)
+	}
+	if got := threads(demoPR480); got.Submitted != nil {
+		t.Fatalf("!unknown recorded a review: %+v", got.Submitted)
+	}
+	if got := appRun(t, demoDo(demoPR480, "submit", map[string]any{"event": "approve", "body": demoUnknownSent})); got["unknown"] != true {
+		t.Fatalf("%v", got)
+	}
+	got := threads(demoPR480)
+	if got.Submitted == nil || got.Submitted.State != "approved" || got.Submitted.ID == "" || got.Submitted.At == 0 {
+		t.Fatalf("submitted %+v", got.Submitted)
+	}
+	first := got.Submitted.ID
+	// Sam's own review on #482, by its id.
+	s := demoRunAs[submitAnswer](t, demoDo(demoPR482, "submit", map[string]any{"reviewId": "PRR_demo_482", "count": 1, "event": "comment"}))
+	if !s.OK {
+		t.Fatalf("%+v", s)
+	}
+	if got := threads(demoPR482); got.Submitted == nil || got.Submitted.ID != "PRR_demo_482" || got.Submitted.State != "commented" || got.Review != nil {
+		t.Fatalf("%+v %+v", got.Submitted, got.Review)
+	}
+	if got := threads(demoPR480); got.Submitted == nil || got.Submitted.ID != first {
+		t.Fatalf("#480's submitted changed: %+v", got.Submitted)
+	}
+}

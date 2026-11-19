@@ -26,11 +26,13 @@ const (
 // threadsAnswer is the `threads` op's answer, the cheap poll: the PR's
 // review threads and the viewer's pending review, from one head.
 type threadsAnswer struct {
-	Head    string       `json:"head"`
-	PR      prInfo       `json:"pr"`
-	Review  *reviewInfo  `json:"review"` // the viewer's pending review; null when there's none
-	Threads []fileThread `json:"threads"`
-	More    bool         `json:"more"` // there's more than was fetched: counts are lower bounds
+	Head   string      `json:"head"`
+	PR     prInfo      `json:"pr"`
+	Review *reviewInfo `json:"review"` // the viewer's pending review; null when there's none
+	// The viewer's latest submitted review; null when there's none.
+	Submitted *submittedInfo `json:"submitted"`
+	Threads   []fileThread   `json:"threads"`
+	More      bool           `json:"more"` // there's more than was fetched: counts are lower bounds
 }
 
 // filesAnswer is the `files` op's answer: what `threads` has, and the files.
@@ -104,6 +106,45 @@ type reviewInfo struct {
 	Body     string `json:"body"`
 	Comments int    `json:"comments"`
 	Commit   string `json:"commit"`
+}
+
+// submittedInfo is the viewer's latest submitted review on the PR. A
+// submit with no pending review whose outcome wasn't known is checked
+// against it: a new one means it went through (spec A6). State is
+// commented, approved, changes_requested or dismissed; At is when GitHub
+// says it was submitted, in ms since the epoch.
+type submittedInfo struct {
+	ID    string `json:"id"`
+	State string `json:"state"`
+	At    int64  `json:"at"`
+}
+
+// gqlSubmitted is a review as the `submitted` read has it.
+type gqlSubmitted struct {
+	ID              string  `json:"id"`
+	State           string  `json:"state"`
+	ViewerDidAuthor bool    `json:"viewerDidAuthor"`
+	SubmittedAt     *string `json:"submittedAt"`
+}
+
+// submittedOf is the viewer's latest submitted review among reviews, or
+// nil. reviews(author:) takes a login, so the filter is viewerDidAuthor; a
+// pending review has no submittedAt.
+func submittedOf(reviews []gqlSubmitted) *submittedInfo {
+	var out *submittedInfo
+	for _, r := range reviews {
+		if !r.ViewerDidAuthor || strings.EqualFold(r.State, "PENDING") || r.SubmittedAt == nil {
+			continue
+		}
+		at, err := time.Parse(time.RFC3339, *r.SubmittedAt)
+		if err != nil {
+			continue
+		}
+		if out == nil || at.UnixMilli() >= out.At {
+			out = &submittedInfo{ID: r.ID, State: strings.ToLower(r.State), At: at.UnixMilli()}
+		}
+	}
+	return out
 }
 
 // diffAnswer is the `diff` op's answer.
@@ -224,6 +265,9 @@ const (
 	// pendingReviewNodes is pendingReviews' selection set, apart so a
 	// directive can go between the two (GraphQL wants it before the braces).
 	pendingReviewNodes = `{ nodes { ` + reviewFields + ` } }`
+	// submittedReviewNodes is the `submitted` read's selection set: the PR's
+	// last reviews (the viewer's among them), as submittedOf wants them.
+	submittedReviewNodes = `{ nodes { id state viewerDidAuthor submittedAt } }`
 )
 
 type pageInfo struct {
@@ -240,6 +284,7 @@ const filesQuery = `query($owner: String!, $name: String!, $n: Int!, $review: Bo
       viewerDidAuthor @include(if: $review)
       state @include(if: $review)
       reviews(states: PENDING, first: 20) @include(if: $review) ` + pendingReviewNodes + `
+      submitted: reviews(last: 10) @include(if: $review) ` + submittedReviewNodes + `
       files(first: 100, after: $fa) @include(if: $files) {
         pageInfo { hasNextPage endCursor }
         nodes { path additions deletions changeType viewerViewedState }
@@ -257,12 +302,13 @@ const filesQuery = `query($owner: String!, $name: String!, $n: Int!, $review: Bo
 // prFiles is what GraphQL has of a PR's files and threads, from one head,
 // and the viewer's pending review.
 type prFiles struct {
-	ID, Head string
-	PR       prInfo
-	Review   *reviewInfo
-	Files    []gqlFile
-	Threads  []gqlThread
-	More     bool
+	ID, Head  string
+	PR        prInfo
+	Review    *reviewInfo
+	Submitted *submittedInfo
+	Files     []gqlFile
+	Threads   []gqlThread
+	More      bool
 }
 
 // errMoved: the head changed between two pages.
@@ -296,6 +342,9 @@ func (c *ghClient) loadFilesOnce(ctx context.Context, r repoRef, number int, wit
 					Reviews         *struct {
 						Nodes []gqlReview `json:"nodes"`
 					} `json:"reviews"`
+					Submitted *struct {
+						Nodes []gqlSubmitted `json:"nodes"`
+					} `json:"submitted"`
 					Files *struct {
 						PageInfo pageInfo  `json:"pageInfo"`
 						Nodes    []gqlFile `json:"nodes"`
@@ -329,6 +378,9 @@ func (c *ghClient) loadFilesOnce(ctx context.Context, r repoRef, number int, wit
 			out.PR = prInfo{ID: pr.ID, Mine: pr.ViewerDidAuthor, State: strings.ToLower(pr.State)}
 			if pr.Reviews != nil {
 				out.Review = pendingOf(pr.Reviews.Nodes)
+			}
+			if pr.Submitted != nil {
+				out.Submitted = submittedOf(pr.Submitted.Nodes)
 			}
 		} else if pr.HeadRefOid != out.Head {
 			return nil, errMoved
@@ -499,7 +551,7 @@ func filesFrom(g *prFiles, rest []restFile) filesAnswer {
 // threadsFrom is the `threads` answer for what GraphQL has: threads in path
 // order, then line order (filesFrom puts them in file order after).
 func threadsFrom(g *prFiles) threadsAnswer {
-	out := threadsAnswer{Head: g.Head, PR: g.PR, Review: g.Review, Threads: []fileThread{}, More: g.More}
+	out := threadsAnswer{Head: g.Head, PR: g.PR, Review: g.Review, Submitted: g.Submitted, Threads: []fileThread{}, More: g.More}
 	for _, t := range g.Threads {
 		out.Threads = append(out.Threads, shapeThread(t))
 	}
