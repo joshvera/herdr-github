@@ -2,14 +2,17 @@
 // keyboard first, then what's asked (a confirm), then what the cursor is
 // on. No imports, so node can run its rules.
 //
-//   key ──► a text box has the keyboard? ──► the filter's, or the
+//   key ──► the submit dialog open? ────────► the dialog's, every one (tab,
+//           │                                1 2 3 too); in its body box
+//           │                                only tab and cmd-enter
+//           a text box has the keyboard? ──► the filter's, or the
 //           │                                composer's (cmd-enter sends,
 //           │                                tab does nothing, the rest types)
 //           held, and not a move? ──────────► nothing
 //           a delete to confirm? ───────────► y deletes, anything else keeps
 //           "Send again?" asked? ───────────► cmd-enter sends, anything else keeps
 //           cmd-enter, the composer open ───► send
-//           review key (c x e shift-d) ─────► allowed here? do it, or say why
+//           review key (c x e shift-d shift-s) ► allowed here? do it, or say why
 //           anything else ──────────────────► the view's moves
 //
 // Typing comes first (spec A5): an x typed in the composer is an x, never a
@@ -21,7 +24,7 @@ export const MOVES = new Set(["j", "k", "down", "up", "]", "[", "n", "p"]);
 
 // The keys that act on the PR's review. They're decided here before the
 // view checks its own state, so each can say why it can't act.
-export const REVIEW_KEYS = new Set(["c", "x", "e", "shift-d"]);
+export const REVIEW_KEYS = new Set(["c", "x", "e", "shift-d", "shift-s"]);
 
 const TABS = new Set(["tab", "shift-tab"]);
 
@@ -30,8 +33,9 @@ export const NEW_COMMITS = "New commits pushed. r reloads.";
 export const OLDER_COMMIT = "Your pending review was started on an older commit. Submit or discard it to comment on the new one.";
 
 /**
- * @typedef {{ keyboard: "view" | "filter" | "composer", composer?: boolean, confirm?: boolean, again?: boolean }} Holder
- *   keyboard: who has it; composer: one is open (focused or not);
+ * @typedef {{ keyboard: "view" | "filter" | "composer" | "body", dialog?: boolean, composer?: boolean, confirm?: boolean, again?: boolean }} Holder
+ *   keyboard: who has it ("body": the submit dialog's text box); dialog:
+ *   the submit dialog is open; composer: one is open (focused or not);
  *   confirm: a delete waits for y; again: "Send again?" is asked.
  */
 
@@ -40,9 +44,13 @@ export const OLDER_COMMIT = "Your pending review was started on an older commit.
  * @param {Holder} h
  * @param {string} k
  * @param {boolean} held a repeat
- * @returns {"type" | "send" | "swallow" | "confirm" | "again" | "review" | "view"}
+ * @returns {"dialog" | "type" | "send" | "swallow" | "confirm" | "again" | "review" | "view"}
  */
 export function route(h, k, held) {
+  if (h.dialog) {
+    if (h.keyboard !== "body") return "dialog";
+    return k === "cmd-enter" ? "send" : TABS.has(k) ? "dialog" : "type";
+  }
   if (h.keyboard === "composer") return k === "cmd-enter" ? "send" : TABS.has(k) ? "swallow" : "type";
   if (h.keyboard !== "view") return "type";
   if (held && !MOVES.has(k)) return "swallow";
@@ -68,6 +76,7 @@ export function latestMine(t) {
  *   | { act: "reply", thread: any }
  *   | { act: "edit", thread: any, comment: any }
  *   | { act: "delete", thread: any, comment: any }
+ *   | { act: "submit" }
  *   | { say: string }} Action
  */
 
@@ -88,6 +97,7 @@ export function reviewAction(k, c) {
   if (!c.follows) return { say: OLD_BINARY };
   const it = c.item ?? null;
   const t = it?.t ?? null;
+  if (k === "shift-s") return { act: "submit" };
   if (t?.local) return { say: "That comment's thread is still being read back from GitHub." };
   if (k === "x") {
     if (!t) return { say: "x resolves a thread: put the cursor on one." };

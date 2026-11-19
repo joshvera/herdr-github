@@ -175,14 +175,16 @@ export class Composer {
   }
 
   /**
-   * How the send ended (mutation.js's outcome kinds).
+   * How the send ended (mutation.js's outcome kinds). A refusal of a send
+   * made after "Could not confirm" says nothing of the earlier one, so the
+   * next send still asks first.
    * @param {"ok" | "refused" | "unknown"} kind
    * @param {string} error GitHub's words, when refused
    * @param {number} now
    */
   outcome(kind, error, now) {
-    this.unconfirmed = false;
     if (kind === "ok") {
+      this.unconfirmed = false;
       this.phase = "done";
       this.note = "";
     } else if (kind === "refused") {

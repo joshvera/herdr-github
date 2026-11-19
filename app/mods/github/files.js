@@ -1,8 +1,9 @@
 // The PR screen's Files changed tab: the PR's changed files as a tree at the
 // left, one file's diff at the right with its review threads between the
 // lines they're on. Every move is one key. What it changes on GitHub: a
-// file's viewed mark, and the review (x resolves a thread), each through
-// `send` or main's mutate, once.
+// file's viewed mark (through main's mutate), and the review (c comments
+// or replies, x resolves, e edits, shift-d deletes, shift-s submits or
+// discards), each through `send`, once.
 //
 // Everything shown is from one head commit (`files` names it). A diff is
 // asked for only once `files` has answered, one at a time, for that head:
@@ -19,21 +20,22 @@
 //   └──────────────────┘ └────────────────────────────────────────────────┘
 //
 // main.js makes one per PR opened (openPR) and gives it every key on this
-// tab first; see `key`. Its filter's InputState, the composer's
-// TextareaState and the lists' scroll handles are main's (made in init, as
+// tab first; see `key`. Its filter's InputState, the composer's and the
+// submit dialog's TextareaStates and the lists' scroll handles are main's (made in init, as
 // the runtime wants), passed as `ui`.
 
 import { div } from "gpui-kit";
 import { v_flex, h_flex, Input, Textarea, Scrollbar, v_virtual_list } from "gpui-base";
 import { createHash } from "crypto";
-import { icon, MONO } from "./look.js";
+import { icon, tint, MONO } from "./look.js";
 import { treeRows, matchesPath, statusMark } from "./filetree.js";
 import { diffItems } from "./diffitems.js";
 import { TREE_ROW_H, treeRow, viewedMark, diffItem } from "./filesdraw.js";
 import { mergeThreads, countThreads, refind, shiftedAbove, PollHealth, HOLD_MS } from "./follow.js";
 import { route, reviewAction, deletePrompt, latestMine, NEW_COMMITS, OLDER_COMMIT } from "./reviewkeys.js";
-import { withResolved, withComment, withReply, withEdit, withoutComment, checked } from "./sent.js";
-import { DraftStore, DRAFTS_KEY, DEMO_DRAFTS_KEY, SAVE_MS, draftId, makeDraft, rowOf, rowTarget, placeDrafts } from "./drafts.js";
+import { withResolved, withComment, withReply, withEdit, withoutComment, withoutPending, checked } from "./sent.js";
+import { DraftStore, DRAFTS_KEY, DEMO_DRAFTS_KEY, SAVE_MS, draftId, makeDraft, rowOf, rowTarget, placeDrafts, unplaced } from "./drafts.js";
+import { SubmitDialog, CHOICES, DIALOG_NOTES } from "./dialog.js";
 import { Composer, CHECK_POLL_MS, NOTES, idsOn, request, purpose } from "./compose.js";
 
 const TREE_W = 290;
@@ -73,7 +75,7 @@ export function fileLink(prUrl, path) {
 export class FilesView {
   /**
    * @param {any} app the GitHub view (main.js)
-   * @param {{ filter: any, composer: any, diffScroll: any, treeScroll: any, height: number }} ui
+   * @param {{ filter: any, composer: any, reviewBody: any, diffScroll: any, treeScroll: any, height: number }} ui
    */
   constructor(app, ui) {
     this.app = app;
@@ -107,6 +109,10 @@ export class FilesView {
     this.composerId = ""; // its draft's id
     this.typed = ""; // what its text box said last
     this.confirm = null; // a delete waiting for y: { thread, comment }
+    this.dialog = null; // the submit dialog (dialog.js), over the tab
+    this.bodyWriting = false; // its text box has the keyboard
+    this.bodyTyped = ""; // what that box said last
+    this.submitted = null; // the viewer's latest submitted review, from the last files or threads
     this.path = null; // the open file
     this.at = 0; // the cursor: an index into items()
     this.target = null; // where the cursor goes once the open file's items come
@@ -138,13 +144,13 @@ export class FilesView {
   // A text box has the keyboard: the filter, or the composer. main's keyDown
   // sends every key to typingKey then, unstopped, so it types.
   get typing() {
-    return this.filtering || this.writing;
+    return this.filtering || this.writing || this.bodyWriting;
   }
 
-  // Something on this tab waits for an answer (a delete's y, "Send
-  // again?"): the footer is only its keys.
+  // Something on this tab waits for an answer (the submit dialog, a
+  // delete's y, "Send again?"): the footer is only its keys.
   modal() {
-    return Boolean(this.confirm) || this.composer?.phase === "again";
+    return Boolean(this.dialog || this.confirm) || this.composer?.phase === "again";
   }
 
   prKey() {
@@ -304,6 +310,7 @@ export class FilesView {
       this.data = { head: res.head, files: res.files ?? [], threads: res.threads ?? [], more: Boolean(res.more) };
       this.indexThreads();
       this.review = res.review ?? null;
+      this.submitted = res.submitted ?? null;
       this.prInfo = res.pr ?? null;
       this.behind = false;
       this.health.ok();
@@ -395,13 +402,18 @@ export class FilesView {
       return this.loadFiles(cx);
     }
     if (this.composer?.tick(Date.now()) === "unconfirmed") this.focusComposer(cx);
+    // The dialog's check runs out, or its "Now 8" ends: drawn again.
+    if (this.dialog) {
+      this.dialog.tick(Date.now());
+      cx.notify();
+    }
     if (this.app.gate.takeOwed() || Date.now() >= this.pollAt) this.poll(cx);
   }
 
   // Polls come every 15 s, and every 5 s while a change's outcome is being
   // checked.
   pollEvery() {
-    return this.composer?.phase === "checking" || this.checks.length ? CHECK_POLL_MS : POLL_MS;
+    return this.composer?.phase === "checking" || this.dialog?.phase === "checking" || this.checks.length ? CHECK_POLL_MS : POLL_MS;
   }
 
   // Reads the PR's threads and pending review (`threads`), one at a time.
@@ -436,6 +448,7 @@ export class FilesView {
       this.applyThreads(res);
       this.answerChecks(res, startedAt, cx);
       this.checkComposer(res, startedAt, cx);
+      this.checkDialog(res, startedAt, cx);
       cx.notify();
     });
   }
@@ -443,6 +456,7 @@ export class FilesView {
   // A `threads` answer into what's shown, moving nothing being read.
   applyThreads(res) {
     this.review = res.review ?? null;
+    this.submitted = res.submitted ?? null;
     if (res.pr) this.prInfo = res.pr;
     if (res.head !== this.data.head) {
       this.behind = true;
@@ -532,6 +546,8 @@ export class FilesView {
       case "delete":
         this.confirm = { thread: what.thread, comment: what.comment };
         return this.say(deletePrompt(what.comment), cx);
+      case "submit":
+        return this.openDialog(cx);
     }
   }
 
@@ -696,13 +712,16 @@ export class FilesView {
     const now = Date.now();
     const send = { state: "sending", since: now, ids: idsOn(target, this.data.threads), body };
     const d = this.drafts.get(id);
+    // A send whose outcome was never known, before this one: kept if this
+    // one is refused, so a reopened composer still checks for it.
+    const prior = d?.send ? { ...d.send, state: "unknown" } : null;
     this.drafts.saveNow({ ...(d ?? makeDraft(target, body, now)), ...target, body, at: now, send });
     this.draftsN++;
     c.target = target;
     c.sending(send);
     this.writing = false;
     this.app.keys.focus();
-    this.send(request(target, body, this.data.head), cx, (r, cx) => this.draftSent(id, target, send, r, cx), async () => {
+    this.send(request(target, body, this.data.head), cx, (r, cx) => this.draftSent(id, target, send, prior, r, cx), async () => {
       await localStorage.flush().catch(() => {});
     });
     cx.notify();
@@ -710,7 +729,7 @@ export class FilesView {
 
   // How a draft's send ended, whether or not its composer is still open:
   // the draft is what's kept.
-  draftSent(id, target, send, r, cx) {
+  draftSent(id, target, send, prior, r, cx) {
     const c = this.composerId === id && this.composer?.send?.since === send.since ? this.composer : null;
     this.draftsN++;
     if (r.answer && "review" in r.answer && this.alive()) this.review = r.answer.review;
@@ -725,7 +744,7 @@ export class FilesView {
     }
     const d = this.drafts.get(id);
     if (r.kind === "refused") {
-      if (d) this.drafts.saveNow({ ...d, send: null });
+      if (d) this.drafts.saveNow({ ...d, send: prior });
       if (r.answer?.stale === true) this.behind = true;
       if (c) {
         c.outcome("refused", r.error, Date.now());
@@ -764,6 +783,152 @@ export class FilesView {
     this.draftsN++;
     this.closeComposer(cx);
     this.say("Sent: it's in your pending review.", cx);
+  }
+
+  // ── the submit dialog ──────────────────────────────────────────────────
+  //
+  // Over the tab, taking every key while it's open (dialog.js decides what
+  // each does). Its text box is main's, like the composer's; what's typed
+  // there is kept as the PR's "body" draft.
+
+  bodyId() {
+    return draftId({ kind: "body", pr: this.prKey() });
+  }
+
+  openDialog(cx) {
+    if (this.composer) this.closeComposer(cx, false);
+    this.confirm = null;
+    this.dialog = new SubmitDialog({ review: this.review, mine: Boolean(this.prInfo?.mine), submitted: this.submitted });
+    this.bodyTyped = this.drafts.get(this.bodyId())?.body ?? this.review?.body ?? "";
+    this.ui.reviewBody.set_value(this.bodyTyped);
+    this.focusBody(cx);
+  }
+
+  focusBody(cx) {
+    const d = this.dialog;
+    if (!d) return;
+    d.focus = "body";
+    this.ui.reviewBody.focus();
+    cx.timer.after(30, () => {
+      if (this.dialog === d && d.focus === "body" && this.alive()) this.ui.reviewBody.focus();
+    });
+    cx.notify();
+  }
+
+  focusChoices(cx) {
+    if (this.dialog) this.dialog.focus = "choices";
+    this.bodyWriting = false;
+    this.app.keys.focus();
+    cx.notify();
+  }
+
+  // Closes it, its text kept as a draft.
+  closeDialog(cx) {
+    if (!this.dialog) return;
+    this.dialogBodyChanged(this.ui.reviewBody.value(), cx);
+    this.dialog = null;
+    this.bodyWriting = false;
+    this.saveDrafts(cx);
+    this.app.keys.focus();
+    cx.notify();
+  }
+
+  // esc: the discard step, or "Send again?", back to the choices; else closed.
+  dialogEscape(cx) {
+    const d = this.dialog;
+    if (d.phase === "discard") {
+      d.cancelDiscard();
+      return this.say("Not discarded.", cx);
+    }
+    if (d.phase === "again") {
+      d.keep();
+      return cx.notify();
+    }
+    this.closeDialog(cx);
+  }
+
+  // The body box's events, through main.
+  dialogBodyChanged(value, cx) {
+    if (!this.dialog || value === this.bodyTyped) return;
+    this.bodyTyped = value;
+    this.keepDraft(makeDraft({ kind: "body", pr: this.prKey() }, value, Date.now()), cx);
+  }
+
+  dialogFocus(on, cx) {
+    this.bodyWriting = on && Boolean(this.dialog);
+    if (this.dialog) this.dialog.focus = on ? "body" : "choices";
+    cx.notify();
+  }
+
+  dialogSubmit(e, cx) {
+    if (e?.secondary === true) this.dialogPress(cx, null);
+  }
+
+  dialogPress(cx, held) {
+    if (this.dialog) this.dialogStep(this.dialog.press(Date.now(), held, this.ui.reviewBody.value()), cx);
+  }
+
+  dialogKey(k, held, cx) {
+    if (this.dialog) this.dialogStep(this.dialog.key(k, held, this.ui.reviewBody.value(), Date.now()), cx);
+  }
+
+  // Does what the dialog said.
+  dialogStep(step, cx) {
+    if (step.do === "say") this.say(step.text, cx, true);
+    else if (step.do === "focus-body") this.focusBody(cx);
+    else if (step.do === "focus-choices") this.focusChoices(cx);
+    else if (step.do === "send") this.sendDialog(step.req, cx);
+    cx.notify();
+  }
+
+  // Submits or discards, once, through send.
+  sendDialog(req, cx) {
+    const d = this.dialog;
+    this.bodyWriting = false;
+    this.app.keys.focus();
+    const sent = this.send(req, cx, (r, cx) => {
+      d.outcome(r.kind, r.answer, r.error ?? "", Date.now());
+      if (r.answer && "review" in r.answer && this.alive()) this.review = r.answer.review;
+      if (r.kind === "ok") return this.reviewDone(req.do, r.answer?.url ?? "", cx);
+      if (this.dialog !== d) this.say(r.kind === "refused" ? r.error : "No answer from GitHub about your review. It may have gone through: look at the PR before sending again.", cx, true);
+    });
+    if (!sent) d.outcome("refused", null, "Still sending the last change: one at a time.", Date.now());
+  }
+
+  // A poll, while the dialog is open: its count follows, and a check after
+  // an unknown outcome reads it.
+  checkDialog(res, startedAt, cx) {
+    const d = this.dialog;
+    if (!d) return;
+    d.follow(res.review ?? null, res.submitted ?? null, Date.now());
+    if (d.poll({ review: res.review ?? null, submitted: res.submitted ?? null }, startedAt) === "sent") {
+      this.reviewDone(d.sent.kind, "", cx, d.note || "");
+    }
+  }
+
+  // The review went (or a check shows it did): the dialog closes, and the
+  // word stays a few seconds. A discard takes its pending comments with it.
+  reviewDone(kind, url, cx, text = "") {
+    if (this.dialog) {
+      this.dialog = null;
+      this.bodyWriting = false;
+      this.app.keys.focus();
+    }
+    this.drafts.remove(this.bodyId());
+    this.draftsN++;
+    if (this.alive()) {
+      this.review = null;
+      if (kind === "discard" && this.data) {
+        this.held.clear();
+        this.setThreads(withoutPending(this.data.threads));
+      }
+    }
+    const said = text || (kind === "discard" ? "Discarded your pending review." : url ? `Review sent: ${url}` : "Review sent.");
+    this.say(said, cx);
+    cx.timer.after(6000, (cx) => {
+      if (this.alive() && this.app.flash === said) this.app.say("", cx);
+    });
+    cx.notify();
   }
 
   // ── drafts ─────────────────────────────────────────────────────────────
@@ -867,8 +1032,13 @@ export class FilesView {
     // (main's keyDown sends it the rest): they don't navigate.
     const to = route(this.holder(), k, held);
     if (to === "type" || to === "swallow") return true;
+    if (to === "dialog") {
+      this.dialogKey(k, held, cx);
+      return true;
+    }
     if (to === "send") {
-      this.composerPress(cx, held);
+      if (this.dialog) this.dialogPress(cx, held);
+      else this.composerPress(cx, held);
       return true;
     }
     if (to === "confirm") {
@@ -929,7 +1099,8 @@ export class FilesView {
   // Who has the keyboard, and what's asked (reviewkeys.js's route).
   holder() {
     return {
-      keyboard: this.writing ? "composer" : this.filtering ? "filter" : "view",
+      keyboard: this.bodyWriting ? "body" : this.writing ? "composer" : this.filtering ? "filter" : "view",
+      dialog: Boolean(this.dialog),
       composer: Boolean(this.composer),
       confirm: Boolean(this.confirm),
       again: this.composer?.phase === "again",
@@ -940,17 +1111,22 @@ export class FilesView {
   // mean more. main's keyDown lets every one through to it. In the
   // composer only cmd-enter does anything (A5): an x typed is an x.
   typingKey(k, cx, held = false) {
-    if (route(this.holder(), k, held) === "send") return this.composerPress(cx, held);
-    if (this.writing) return;
+    if (route(this.holder(), k, held) === "send") return this.dialog ? this.dialogPress(cx, held) : this.composerPress(cx, held);
+    if (this.writing || this.bodyWriting) return;
     if (k === "enter") this.leaveFilter(false, cx);
     else if (k === "down" || k === "up") this.stepFile(k === "down" ? 1 : -1, cx);
   }
 
-  // esc on this tab: true when it was this tab's. In order: a delete's
+  // esc on this tab: true when it was this tab's. In order: the submit
+  // dialog (its discard step or "Send again?" first), a delete's
   // confirm (kept), "Send again?" (back to the draft), the composer (closed,
   // its draft kept), the filter (cleared, and left). One press, whichever
   // way it comes, does only the first.
   escape(cx) {
+    if (this.dialog) {
+      this.dialogEscape(cx);
+      return true;
+    }
     if (this.confirm) {
       this.confirm = null;
       this.say("Kept.", cx);
@@ -1154,6 +1330,7 @@ export class FilesView {
   // ── drawing ────────────────────────────────────────────────────────────
 
   footer(k) {
+    if (this.dialog) return this.dialogFooter(k);
     if (this.confirm) {
       return [
         k(["y"], "delete", (cx) => this.confirmKey("y", cx), "f-del-y"),
@@ -1200,10 +1377,25 @@ export class FilesView {
     return out;
   }
 
+  dialogFooter(k) {
+    const d = this.dialog;
+    const esc = (label) => k(["esc"], label, (cx) => this.dialogEscape(cx), "f-dlg-esc");
+    if (d.phase === "discard") return [k(["enter"], "discard, once it's typed", (cx) => this.dialogKey("enter", false, cx), "f-dlg-go"), esc("cancel")];
+    if (d.phase === "again") return [k(["cmd-enter"], "send again", (cx) => this.dialogPress(cx, false), "f-dlg-go"), esc("keep it unsent")];
+    if (d.phase === "sending" || d.phase === "checking") return [esc("close")];
+    return [
+      k(["tab"], d.focus === "body" ? "the choices" : "the text", (cx) => this.dialogKey("tab", false, cx), "f-dlg-tab"),
+      k(["1", "2", "3"], "choose", (cx) => this.dialogKey("down", false, cx), "f-dlg-pick"),
+      k(["cmd-enter"], d.button(this.ui.reviewBody.value()), (cx) => this.dialogPress(cx, false), "f-dlg-go"),
+      esc("close, keeps the text"),
+    ];
+  }
+
   // The review keys that apply to what the cursor is on.
   reviewFooter(k) {
     if (!this.follows()) return [];
     const out = [];
+    out.push(k(["shift-s"], this.review ? "submit review" : "review", (cx) => this.reviewKey("shift-s", cx), "f-s"));
     if (this.composer) {
       out.push(k(["cmd-enter"], "send the composer's", (cx) => this.composerPress(cx, false), "f-send"));
       out.push(k(["esc"], "close the composer", (cx) => this.escape(cx), "f-close"));
@@ -1244,9 +1436,77 @@ export class FilesView {
         .child(div().text_size(12.8).text_color(o.dim).child("r tries again; o opens the files on GitHub."));
     }
     if (this.state !== "ok") return v_flex().h(H).p(14).child(div().text_size(12.8).text_color(o.dim).child("Loading its files…"));
-    return h_flex().h(H).min_h(0).gap(12).items_start()
+    const tab = h_flex().h(H).min_h(0).gap(12).items_start()
       .child(this.treePane(o, H))
       .child(this.diffPane(o, H));
+    if (!this.dialog) return tab;
+    return div().relative().h(H).w_full()
+      .child(tab)
+      .child(div().absolute().inset_0().flex().items_center().justify_center().bg(tint(o.surface, 0.72))
+        .child(this.dialogView(o)));
+  }
+
+  // The submit dialog: what the review holds, drafts not in it, its text,
+  // the choices, and what cmd-enter will do; or the discard step.
+  dialogView(o) {
+    const d = this.dialog;
+    const now = Date.now();
+    const body = this.ui.reviewBody.value();
+    const flash = d.flashing(now);
+    const panel = v_flex().w(Math.min(620, this.app.width - 80)).gap(10).p(16).rounded(10).border_1().border_color(o.line).bg(o.surface).shadow_md()
+      .child(div().text_size(14).font_semibold().text_color(o.fg).child("Your review"))
+      .child(h_flex().gap(10).items_center()
+        .child(div().text_size(13).text_color(o.fg).child(d.countLine()))
+        .when(Boolean(flash), (el) => el.child(div().text_size(12.5).font_medium().text_color(o.work).child(flash))));
+    if (d.phase === "discard") {
+      return panel
+        .child(div().text_size(12.8).text_color(o.fix).child(d.discardLine()))
+        .child(div().h(30).px(10).flex().items_center().rounded(6).border_1().border_color(o.fix).bg(o.sunk)
+          .font_family(MONO).text_size(12.5).text_color(o.fg).child(`${d.typed}▏`))
+        .child(div().text_size(11.5).text_color(o.dim).child("Anything else cancels."));
+    }
+    const ds = this.drafts.forPR(this.prKey()).filter((x) => x.kind !== "body");
+    const loose = unplaced(ds, this.data.head);
+    const n = ds.length - loose.length;
+    const offered = d.offered(body);
+    const editable = d.phase === "choose";
+    return panel
+      .when(n > 0, (el) => el.child(div().text_size(12).text_color(o.work)
+        .child(`${n} ${n === 1 ? "draft is" : "drafts are"} not part of the review. cmd-enter in the composer adds one.`)))
+      .when(loose.length > 0, (el) => el.child(v_flex().gap(4)
+        .child(div().text_size(12).text_color(o.work).child("From an older commit, and no longer on a line here (click to copy, or drop):"))
+        .children(loose.map((x, i) => h_flex().gap(8).items_center().text_size(11.5)
+          .child(div().id(`loose-${i}`).flex_1().min_w(0).truncate().cursor_pointer().text_color(o.muted)
+            .hover((st) => st.text_color(o.fg))
+            .on_click((_e, cx) => {
+              cx.write_to_clipboard(x.body);
+              this.say("Copied the draft.", cx);
+            })
+            .child(`${x.path} line ${x.line}: ${x.body.split("\n")[0]}`))
+          .child(div().id(`drop-${i}`).flex_none().cursor_pointer().text_color(o.fix).hover((st) => st.underline())
+            .on_click((_e, cx) => {
+              this.drafts.remove(x.id);
+              this.draftsN++;
+              this.say("Dropped that draft.", cx);
+            })
+            .child("drop"))))))
+      .child(div().text_size(11.5).text_color(o.dim).child("The review's text (optional)"))
+      .child(editable
+        ? div().rounded(6).border_1().border_color(this.bodyWriting ? o.accent : o.line).child(Textarea.new(this.ui.reviewBody).w_full().text_size(12.5).text_color(o.fg))
+        : div().max_h(120).overflow_hidden().p(8).rounded(6).bg(o.sunk).text_size(12.5).text_color(o.muted).child(body || " "))
+      .child(v_flex().gap(2).children(CHOICES.map((c, i) => {
+        const on = d.pick === c.id;
+        const ok = offered.some((x) => x.id === c.id);
+        return h_flex().h(26).px(8).gap(10).items_center().rounded(6)
+          .when(on && d.focus === "choices", (el) => el.bg(tint(o.accent, 0.18)))
+          .when(on && d.focus !== "choices", (el) => el.bg(o.sunk))
+          .child(div().flex_none().w(14).font_family(MONO).text_size(11.5).text_color(o.dim).child(i < 3 ? String(i + 1) : ""))
+          .child(div().text_size(13).text_color(!ok ? o.dim : c.id === "discard" ? o.fix : on ? o.fg : o.muted)
+            .when(on, (el) => el.font_medium())
+            .child(ok ? c.label : `${c.label} (not offered)`));
+      })))
+      .child(div().text_size(13).font_semibold().text_color(d.pick === "discard" ? o.fix : o.accent).child(d.button(body)))
+      .when(Boolean(d.note), (el) => el.child(div().text_size(12).text_color(d.phase === "sending" ? o.dim : d.note === DIALOG_NOTES.gone ? o.review : o.work).child(d.note)));
   }
 
   // The tree: the filter, how many files are viewed, and the files.

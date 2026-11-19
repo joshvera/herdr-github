@@ -282,7 +282,14 @@ export default class GitHub extends View {
     composer.on("focus", (_e, cx) => this.files?.composerFocus(true, cx));
     composer.on("blur", (_e, cx) => this.files?.composerFocus(false, cx));
     composer.on("submit", (e, cx) => this.files?.composerSubmit(e, cx));
-    this.filesUI = { filter, composer, diffScroll: VirtualListScrollHandle.new(), treeScroll: VirtualListScrollHandle.new(), height: PR_BODY_H };
+    // The submit dialog's text box: the review's own text.
+    const reviewBody = TextareaState.new({ placeholder: "Say something about the whole PR (optional)" });
+    reviewBody.set_auto_grow(3, 8);
+    reviewBody.on("change", (_e, cx) => this.files?.dialogBodyChanged(reviewBody.value(), cx));
+    reviewBody.on("focus", (_e, cx) => this.files?.dialogFocus(true, cx));
+    reviewBody.on("blur", (_e, cx) => this.files?.dialogFocus(false, cx));
+    reviewBody.on("submit", (e, cx) => this.files?.dialogSubmit(e, cx));
+    this.filesUI = { filter, composer, reviewBody, diffScroll: VirtualListScrollHandle.new(), treeScroll: VirtualListScrollHandle.new(), height: PR_BODY_H };
 
     cx.spawn(async (cx) => {
       await this.readCache(cx);

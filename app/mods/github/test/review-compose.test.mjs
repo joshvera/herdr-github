@@ -166,3 +166,15 @@ test("the line above the composer says what it's for", () => {
   assert.equal(purpose({ kind: "edit", path: "a.go", line: 3, published: false }), "Edit your pending comment on a.go line 3");
   assert.equal(purpose({ kind: "edit", path: "a.go", line: 3, published: true }), "Edit your published comment on a.go line 3. Changes show at once.");
 });
+
+test("a refused resend after 'could not confirm' still asks first next time", () => {
+  const c = sent("hi");
+  c.outcome("unknown", "", T0 + 1000);
+  c.poll([], T0 + 6000);
+  c.tick(T0 + 1000 + CHECK_MS);
+  c.press(T0 + 70000, false);
+  assert.equal(c.press(T0 + 71000, false), "send");
+  c.sending(sendOf("hi", [], T0 + 71000));
+  c.outcome("refused", "GitHub: Line could not be resolved", T0 + 72000);
+  assert.equal(c.press(T0 + 80000, false), "ask", "the first send may still have gone");
+});

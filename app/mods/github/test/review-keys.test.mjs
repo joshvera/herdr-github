@@ -123,3 +123,12 @@ test("e on a pending comment waits for r after new commits; a published one does
 test("every review key on an old herdr-github says so", () => {
   for (const k of ["c", "x", "e", "shift-d"]) assert.equal(reviewAction(k, { ...onRow(), follows: false }).say, OLD_BINARY, k);
 });
+
+test("shift-s opens the submit dialog from anywhere on the tab, once the files are read", () => {
+  assert.equal(route(view, "shift-s", false), "review");
+  assert.equal(route(view, "shift-s", true), "swallow");
+  assert.deepEqual(reviewAction("shift-s", onRow()), { act: "submit" });
+  assert.deepEqual(reviewAction("shift-s", { state: "ok", follows: true, item: null }), { act: "submit" });
+  assert.equal(reviewAction("shift-s", { state: "ok", follows: false, item: null }).say, OLD_BINARY);
+  assert.match(reviewAction("shift-s", { state: "loading", follows: false, item: null }).say, /Still loading/);
+});
