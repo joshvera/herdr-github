@@ -1,7 +1,7 @@
 // What a change sent from the Files tab does to the threads shown (sent.js).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { withResolved, withComment, withReply, withEdit, withoutComment, withoutPending, latestMine, checked } from "../sent.js";
+import { withResolved, withComment, withReply, withEdit, withoutComment, withoutPending, checked } from "../sent.js";
 
 const comment = (id, extra = {}) => ({ id, author: "sam", body: "hi", created: 1, state: "submitted", url: "", mine: false, canEdit: false, canDelete: false, ...extra });
 const thread = (id, comments, extra = {}) => ({
@@ -63,12 +63,6 @@ test("discarding drops pending comments and the threads they leave empty", () =>
   const out = withoutPending(before);
   assert.deepEqual(out.map((t) => t.id), ["T1"]);
   assert.deepEqual(out[0].comments.map((c) => c.id), ["C1"]);
-});
-
-test("e and shift-d act on the viewer's latest comment in the thread", () => {
-  const t = thread("T1", [comment("C1", { mine: true }), comment("C2"), comment("C3", { mine: true }), comment("C4")]);
-  assert.equal(latestMine(t).id, "C3");
-  assert.equal(latestMine(thread("T2", [comment("C5")])), null);
 });
 
 test("a check after an unknown outcome reads the truth from the poll", () => {

@@ -69,15 +69,6 @@ export function withoutPending(threads) {
     .filter((t) => t.comments.length > 0);
 }
 
-/**
- * The viewer's latest comment in a thread: what e and shift-d act on.
- * @param {any} t
- */
-export function latestMine(t) {
-  for (let i = t.comments.length - 1; i >= 0; i--) if (t.comments[i].mine) return t.comments[i];
-  return null;
-}
-
 // After an unknown outcome of x or shift-d, the next poll that started
 // after the change ended says what happened (spec: "No answer. Checking…").
 //

@@ -11,7 +11,7 @@
 
 import { View, div } from "gpui-kit";
 import * as fs from "fs/promises";
-import { v_flex, h_flex, InputState, Input, TextView, Scrollbar, v_virtual_list, VirtualListScrollHandle, ScrollHandle } from "gpui-base";
+import { v_flex, h_flex, InputState, TextareaState, Input, TextView, Scrollbar, v_virtual_list, VirtualListScrollHandle, ScrollHandle } from "gpui-base";
 import { agents, panes, machines, spaces, run, exec, theme, appHome, props, closeOverlay, openOverlay, nextCommand, knownAgents } from "herdr";
 import { demoAgents, DEMO_REPO } from "./demo.js";
 import { tones, tint, countPill, groupOf, toneColor, prLook, checkLook, ago, icon, chip, words, key, cap, MONO } from "./look.js";
@@ -275,7 +275,14 @@ export default class GitHub extends View {
     filter.on("focus", (_e, cx) => this.files?.filterFocus(true, cx));
     filter.on("blur", (_e, cx) => this.files?.filterFocus(false, cx));
     filter.on("submit", (_e, cx) => this.files?.typingKey("enter", cx));
-    this.filesUI = { filter, diffScroll: VirtualListScrollHandle.new(), treeScroll: VirtualListScrollHandle.new(), height: PR_BODY_H };
+    // The composer's text box: grows with what's typed, 3 to 10 rows.
+    const composer = TextareaState.new({ placeholder: "Write a comment. Markdown works." });
+    composer.set_auto_grow(3, 10);
+    composer.on("change", (_e, cx) => this.files?.composerChanged(composer.value(), cx));
+    composer.on("focus", (_e, cx) => this.files?.composerFocus(true, cx));
+    composer.on("blur", (_e, cx) => this.files?.composerFocus(false, cx));
+    composer.on("submit", (e, cx) => this.files?.composerSubmit(e, cx));
+    this.filesUI = { filter, composer, diffScroll: VirtualListScrollHandle.new(), treeScroll: VirtualListScrollHandle.new(), height: PR_BODY_H };
 
     cx.spawn(async (cx) => {
       await this.readCache(cx);
@@ -635,6 +642,13 @@ export default class GitHub extends View {
       return cx.notify();
     }
     this.dismiss();
+  }
+
+  // The popup is going (closed, or the app quitting): drafts typed on the
+  // Files tab are written now, and onto disk before the 250 ms run out.
+  async close() {
+    this.files?.close();
+    await localStorage.flush();
   }
 
   dismiss() {
@@ -1007,7 +1021,7 @@ export default class GitHub extends View {
     if (k === "escape") {
       if (!e.is_held) this.escape(cx);
     } else if (this.filesTyping()) {
-      this.files.typingKey(k, cx);
+      this.files.typingKey(k, cx, Boolean(e.is_held));
       return cx.notify();
     } else if (!this.press(k, cx, Boolean(e.is_held))) return;
     cx.stop_propagation();
@@ -1562,8 +1576,9 @@ export default class GitHub extends View {
     if (this.screen === "pr") {
       const tabs = k(["1", "2", "3"], "tabs", (cx) => this.setPrTab(tabFor("tab", this.prTab), cx), "f-tabs");
       const back = k(["esc"], "back", (cx) => this.escape(cx), "f-esc");
-      // While its filter has the keyboard, 1 2 3 and esc are the filter's.
-      if (this.prTab === "files") return this.files.typing ? this.files.footer(k) : [...this.files.footer(k), tabs, back];
+      // While a text box of its has the keyboard (or it asks something), 1 2
+      // 3 and esc are its own.
+      if (this.prTab === "files") return this.files.typing || this.files.modal() ? this.files.footer(k) : [...this.files.footer(k), tabs, back];
       if (this.prTab === "checks") {
         return [
           k(["↑", "↓"], "choose", () => {}, "f-ch"),
