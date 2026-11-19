@@ -71,6 +71,10 @@ export function withoutPending(threads) {
 
 // After an unknown outcome of x or shift-d, the next poll that started
 // after the change ended says what happened (spec: "No answer. Checking…").
+// With no such poll in CHECK_MS (polls failing, new commits), it's let go,
+// and said so.
+
+export const CHECK_MS = 60000;
 //
 //   { kind: "resolve", thread, want }  the thread's resolved state now
 //   { kind: "delete", comment }        whether the comment is still there

@@ -33,10 +33,10 @@ import { diffItems } from "./diffitems.js";
 import { TREE_ROW_H, treeRow, viewedMark, diffItem } from "./filesdraw.js";
 import { mergeThreads, countThreads, refind, shiftedAbove, PollHealth, HOLD_MS } from "./follow.js";
 import { route, reviewAction, deletePrompt, latestMine, NEW_COMMITS, OLDER_COMMIT } from "./reviewkeys.js";
-import { withResolved, withComment, withReply, withEdit, withoutComment, withoutPending, checked } from "./sent.js";
-import { DraftStore, DRAFTS_KEY, DEMO_DRAFTS_KEY, SAVE_MS, draftId, makeDraft, rowOf, rowTarget, placeDrafts, unplaced } from "./drafts.js";
+import { withResolved, withComment, withReply, withEdit, withoutComment, withoutPending, checked, CHECK_MS } from "./sent.js";
+import { DraftStore, DRAFTS_KEY, DEMO_DRAFTS_KEY, SAVE_MS, draftId, makeDraft, rowOf, rowTarget, placeDrafts, unplaced, droppedNote } from "./drafts.js";
 import { SubmitDialog, CHOICES, DIALOG_NOTES } from "./dialog.js";
-import { Composer, CHECK_POLL_MS, NOTES, idsOn, request, purpose } from "./compose.js";
+import { Composer, CHECK_POLL_MS, NOTES, idsOn, request, purpose, typedSince } from "./compose.js";
 
 const TREE_W = 290;
 const FILTER_H = 30;
@@ -401,7 +401,15 @@ export class FilesView {
       this.filesOwed = false;
       return this.loadFiles(cx);
     }
-    if (this.composer?.tick(Date.now()) === "unconfirmed") this.focusComposer(cx);
+    // "Could not confirm" comes 60 s on, maybe mid-move in the diff: the box
+    // is editable again, but the keyboard stays where it is.
+    if (this.composer?.tick(Date.now()) === "unconfirmed") cx.notify();
+    // A check no poll has answered in 60 s (failing, or new commits) is let go.
+    const late = this.checks.filter((c) => Date.now() >= c.after + CHECK_MS);
+    if (late.length) {
+      this.checks = this.checks.filter((c) => !late.includes(c));
+      this.say("Couldn't check whether the last change went through: look at the PR (r reads it again).", cx, true);
+    }
     // The dialog's check runs out, or its "Now 8" ends: drawn again.
     if (this.dialog) {
       this.dialog.tick(Date.now());
@@ -590,8 +598,10 @@ export class FilesView {
   // Opens it on `target`, with that target's draft, else `prefill`. One
   // that was open closes, its draft kept.
   openComposer(target, prefill, cx) {
-    if (this.composer) this.closeComposer(cx, false);
     const id = draftId(target);
+    // Already open on it: the keyboard back into it, nothing reset.
+    if (this.composer && this.composerId === id) return this.focusComposer(cx);
+    if (this.composer) this.closeComposer(cx, false);
     const draft = this.drafts.get(id);
     this.composer = new Composer(target, draft, Date.now());
     this.composerId = id;
@@ -613,6 +623,9 @@ export class FilesView {
   focusComposer(cx) {
     const c = this.composer;
     if (!c?.editable()) return;
+    // Typing from now: a key before the box's focus event is the box's,
+    // never a review key (A5).
+    this.writing = true;
     this.ui.composer.focus();
     cx.timer.after(30, () => {
       if (this.composer === c && c.editable() && this.alive()) this.ui.composer.focus();
@@ -779,8 +792,18 @@ export class FilesView {
     const c = this.composer;
     if (!c) return;
     if (c.poll(res.threads ?? [], startedAt) !== "sent") return;
-    this.drafts.remove(this.composerId);
+    const id = this.composerId;
+    const d = this.drafts.get(id);
     this.draftsN++;
+    // Typed since that send (after "Could not confirm"): what was sent went
+    // through, and the newer text stays a draft.
+    if (typedSince(d, c.send)) {
+      this.drafts.saveNow({ ...d, send: null });
+      this.composer = null;
+      this.openComposer(c.target, d.body, cx);
+      return this.say("The text you sent earlier went through. What you typed since is kept here.", cx);
+    }
+    this.drafts.remove(id);
     this.closeComposer(cx);
     this.say("Sent: it's in your pending review.", cx);
   }
@@ -808,6 +831,7 @@ export class FilesView {
     const d = this.dialog;
     if (!d) return;
     d.focus = "body";
+    this.bodyWriting = true;
     this.ui.reviewBody.focus();
     cx.timer.after(30, () => {
       if (this.dialog === d && d.focus === "body" && this.alive()) this.ui.reviewBody.focus();
@@ -947,7 +971,7 @@ export class FilesView {
 
   saveDrafts(cx) {
     const { dropped } = this.drafts.flush();
-    if (dropped.length) this.say(`Dropped your oldest draft (on ${dropped[0].path ?? `#${this.pr.number}`})`, cx);
+    if (dropped.length) this.say(droppedNote(dropped[0]), cx);
   }
 
   // A diff came for the head shown: new-comment drafts typed at another
@@ -985,6 +1009,9 @@ export class FilesView {
 
   // The popup is closing: what's typed is written now.
   close() {
+    if (this.dialog && this.ui.reviewBody.value() !== this.bodyTyped) {
+      this.drafts.put(makeDraft({ kind: "body", pr: this.prKey() }, this.ui.reviewBody.value(), Date.now()));
+    }
     if (this.composer?.editable()) {
       const value = this.ui.composer.value();
       const d = this.drafts.get(this.composerId);
@@ -1442,8 +1469,8 @@ export class FilesView {
     if (!this.dialog) return tab;
     return div().relative().h(H).w_full()
       .child(tab)
-      .child(div().absolute().inset_0().flex().items_center().justify_center().bg(tint(o.surface, 0.72))
-        .child(this.dialogView(o)));
+      .child(div().id("files-dialog").absolute().inset_0().flex().items_center().justify_center().bg(tint(o.surface, 0.72))
+        .child(this.safe(() => this.dialogView(o), NOTE_H, "The submit dialog couldn't be drawn")));
   }
 
   // The submit dialog: what the review holds, drafts not in it, its text,
@@ -1474,7 +1501,7 @@ export class FilesView {
       .when(n > 0, (el) => el.child(div().text_size(12).text_color(o.work)
         .child(`${n} ${n === 1 ? "draft is" : "drafts are"} not part of the review. cmd-enter in the composer adds one.`)))
       .when(loose.length > 0, (el) => el.child(v_flex().gap(4)
-        .child(div().text_size(12).text_color(o.work).child("From an older commit, and no longer on a line here (click to copy, or drop):"))
+        .child(div().text_size(12).text_color(o.work).child("Typed at an older commit, and not on a line of this one (click to copy, or drop):"))
         .children(loose.map((x, i) => h_flex().gap(8).items_center().text_size(11.5)
           .child(div().id(`loose-${i}`).flex_1().min_w(0).truncate().cursor_pointer().text_color(o.muted)
             .hover((st) => st.text_color(o.fg))
@@ -1482,7 +1509,7 @@ export class FilesView {
               cx.write_to_clipboard(x.body);
               this.say("Copied the draft.", cx);
             })
-            .child(`${x.path} line ${x.line}: ${x.body.split("\n")[0]}`))
+            .child(`${x.path} line ${x.line}${this.diffs.get(x.path)?.state === "ok" ? "" : " (its file not read yet)"}: ${x.body.split("\n")[0]}`))
           .child(div().id(`drop-${i}`).flex_none().cursor_pointer().text_color(o.fix).hover((st) => st.underline())
             .on_click((_e, cx) => {
               this.drafts.remove(x.id);
@@ -1519,7 +1546,7 @@ export class FilesView {
     return v_flex().w(TREE_W).flex_none().h(H).gap(GAP)
       .child(h_flex().id("files-filter").flex_none().h(FILTER_H).px(10).gap(8).items_center().rounded(8).border_1()
         .border_color(this.filtering ? o.accent : o.line).bg(o.sunk)
-        .on_click((_e, cx) => this.startFilter(cx))
+        .on_click((_e, cx) => !this.dialog && this.startFilter(cx))
         .child(icon("search", o.dim, 13))
         .child(Input.new(this.ui.filter).flex_1().h_full().text_size(12.5).text_color(o.fg)))
       .child(h_flex().flex_none().h(SUMMARY_H).gap(8).items_center().text_size(11.5).text_color(o.dim)
@@ -1531,6 +1558,7 @@ export class FilesView {
             (range) => rows.slice(range.start, range.end).map((r) => this.safe(() => treeRow(o, r, r.file?.path === this.path), TREE_ROW_H, r.name)))
             .track_scroll(this.ui.treeScroll).size_full()
             .on_item_click((key, cx) => {
+              if (this.dialog) return; // under the dialog: not this click's
               const r = rows.find((x) => x.key === key);
               if (r?.file) this.openFile(r.file.path, cx);
             }))
@@ -1580,6 +1608,7 @@ export class FilesView {
             })
             .track_scroll(this.ui.diffScroll).size_full()
             .on_item_click((key, cx) => {
+              if (this.dialog) return; // under the dialog: not this click's
               const i = items.findIndex((x) => x.key === key);
               if (i < 0) return;
               if (i === this.at && items[i].t) return this.toggleFold(cx);
@@ -1588,7 +1617,7 @@ export class FilesView {
             }))
           .child(Scrollbar.vertical("gh-diff").absolute().inset_0())))
       .when(composing && !items?.length, (el) => el.child(div().flex_1().min_h(0)))
-      .when(composing, (el) => el.child(this.composerView(o)));
+      .when(composing, (el) => el.child(this.safe(() => this.composerView(o), NOTE_H, "The composer couldn't be drawn")));
   }
 
   // The composer, docked under the diff: what it's for, the text box (or,
@@ -1611,7 +1640,7 @@ export class FilesView {
     if (c.phase === "again") return "cmd-enter sends again · esc keeps the draft";
     if (c.phase === "sending" || c.phase === "checking") return "esc closes it; the draft is kept";
     const verb = c.target.kind === "edit" ? "saves" : "adds it to your pending review";
-    return `cmd-enter ${verb} · esc closes, keeping the draft${this.writing ? "" : " · click the box to type"}`;
+    return `cmd-enter ${verb} · esc closes, keeping the draft${this.writing ? "" : " · click the box (or c on its line) to type"}`;
   }
 
   // The open file's header: status, path (and where it came from), size,

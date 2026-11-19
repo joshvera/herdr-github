@@ -147,6 +147,14 @@ export class DraftStore {
 }
 
 /**
+ * What the view says when the cap dropped a draft.
+ * @param {Draft} d
+ */
+export function droppedNote(d) {
+  return `Dropped your oldest draft (on ${d.path || "the review's text"})`;
+}
+
+/**
  * The diff row a new-comment draft is on: same side, line AND text. -1 when
  * there's none (the line moved or changed with new commits).
  * @param {{ kind: string, old: number, new: number, text: string }[]} rows

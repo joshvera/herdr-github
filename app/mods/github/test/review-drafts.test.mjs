@@ -1,7 +1,7 @@
 // Drafts kept in localStorage (drafts.js).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { DraftStore, MAX_DRAFTS, DRAFTS_KEY, DEMO_DRAFTS_KEY, draftId, makeDraft, rowOf, rowTarget, placeDrafts, unplaced } from "../drafts.js";
+import { DraftStore, MAX_DRAFTS, DRAFTS_KEY, DEMO_DRAFTS_KEY, draftId, makeDraft, rowOf, rowTarget, placeDrafts, unplaced, droppedNote } from "../drafts.js";
 
 // localStorage as the runtime has it: strings in, strings out, and a count
 // of writes.
@@ -62,7 +62,8 @@ test("past 50 drafts the oldest goes, and is handed back to be named", () => {
   const { dropped } = a.saveNow(makeDraft(onLine(99, "l99"), "the 51st", 99));
   assert.equal(dropped.length, 1);
   assert.equal(dropped[0].body, "draft 2");
-  assert.equal(dropped[0].path, "a.go", "the view says which file it was on");
+  assert.equal(droppedNote(dropped[0]), "Dropped your oldest draft (on a.go)");
+  assert.equal(droppedNote(makeDraft({ kind: "body", pr: PR }, "x", 1)), "Dropped your oldest draft (on the review's text)");
   const left = new DraftStore(s, DRAFTS_KEY).forPR(PR);
   assert.equal(left.length, MAX_DRAFTS);
   assert.ok(left.some((d) => d.body === "sending one"));

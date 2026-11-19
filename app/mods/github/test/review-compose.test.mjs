@@ -1,7 +1,7 @@
 // The composer's state machine and its check (compose.js).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { Composer, NOTES, CHECK_MS, BINARY_MS, REPEAT_MS, found, idsOn, request, purpose, sameBody } from "../compose.js";
+import { Composer, NOTES, CHECK_MS, BINARY_MS, REPEAT_MS, found, idsOn, request, purpose, sameBody, typedSince } from "../compose.js";
 
 const T0 = 1_800_000_000_000;
 const PR = "github.com/acme/app#7";
@@ -103,11 +103,19 @@ test("esc at Send again? keeps the draft unsent and still asks next time", () =>
   assert.equal(c.press(T0 + 72000, false), "ask");
 });
 
-test("60 s with no poll that could have seen it isn't 'could not confirm'", () => {
+test("with every poll failing, 60 s still ends in 'could not confirm'", () => {
   const c = sent("hi");
   c.outcome("unknown", "", T0 + 1000);
-  assert.equal(c.tick(T0 + 1000 + CHECK_MS + 5000), null);
-  assert.equal(c.phase, "checking");
+  assert.equal(c.tick(T0 + 1000 + CHECK_MS), "unconfirmed");
+  assert.equal(c.phase, "editing");
+});
+
+test("found after more was typed: only the send is let go, the newer text is kept", () => {
+  const send = sendOf("first words");
+  assert.equal(typedSince({ body: "first words\r\n", send }, send), false, "the same text: the draft goes");
+  assert.equal(typedSince({ body: "second thoughts", send }, send), true);
+  assert.equal(typedSince({ body: "  ", send }, send), false);
+  assert.equal(typedSince(null, send), false);
 });
 
 test("reopened with a draft that was sending: it checks before it can be sent", () => {
@@ -121,7 +129,7 @@ test("reopened with a draft that was sending: it checks before it can be sent", 
   // The old send may still land until the binary's deadline: a poll before
   // that can find it but can't say it isn't there.
   assert.equal(c.poll([], now + 100), "waiting");
-  assert.equal(c.tick(since + BINARY_MS + CHECK_MS), null, "no poll after the deadline yet");
+  assert.equal(c.tick(since + BINARY_MS + CHECK_MS - 1), null, "60 s from the binary's deadline, not from the reopen");
   assert.equal(c.poll([thread("T1", [comment("C1", "hi"), comment("C5", "hi")])], since + BINARY_MS + 1), "sent");
 });
 

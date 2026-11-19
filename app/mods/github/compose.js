@@ -10,15 +10,15 @@
 //     │                    ▼          a poll after the send ended
 //     │                 checking ─── has a new comment of yours, ──► done
 //     │                    │          same target, same text
-//     │                    │ 60 s, and a poll that could have seen it
+//     │                    │ 60 s (from the binary's deadline, when reopened)
 //     │                    ▼
 //     │   unconfirmed editing ── cmd-enter ──► again ── cmd-enter ──► sending
 //     └────────────────────────────────── esc ◄─┘
 //
 // A draft found in the `sending` or `unknown` state (the popup closed or the
 // app quit mid-send) opens in `checking`. The send it records may still be
-// on its way (the binary's deadline is BINARY_MS), so only a poll started
-// after that can count as "not found".
+// on its way (the binary's deadline is BINARY_MS), so its 60 s of checking
+// start from there.
 
 export const CHECK_MS = 60000;
 export const CHECK_POLL_MS = 5000;
@@ -65,6 +65,17 @@ export function found(target, send, threads) {
   if (target.kind === "edit") return threads.some((t) => t.comments.some((c) => c.id === target.comment && sameBody(c.body, send.body)));
   const before = new Set(send.ids);
   return commentsOn(target, threads).some((c) => c.mine && !before.has(c.id) && sameBody(c.body, send.body));
+}
+
+/**
+ * Whether a draft holds text typed after the send that was just found (a
+ * send after "Could not confirm" is checked with the draft still open to
+ * typing): then that text is kept as the draft, and only the send is let go.
+ * @param {import("./drafts.js").Draft | null} draft
+ * @param {import("./drafts.js").SendState} send
+ */
+export function typedSince(draft, send) {
+  return Boolean(draft) && draft.body.trim() !== "" && !sameBody(draft.body, send.body);
 }
 
 /**
@@ -116,12 +127,12 @@ export class Composer {
     this.lastPress = -Infinity;
     /** @type {import("./drafts.js").SendState | null} */
     this.send = null;
-    /** @type {{ from: number, after: number, until: number, seen: boolean } | null} */
+    /** @type {{ from: number, after: number, until: number } | null} */
     this.check = null;
     if (draft?.send) {
       this.send = draft.send;
-      // Polls from now on can find it; only those after the binary's
-      // deadline can say it isn't there.
+      // Polls from now on can find it; it's "not found yet" only once the
+      // binary's deadline has passed.
       this.checking(now, Math.max(now, draft.send.since + BINARY_MS), NOTES.reopened);
     }
   }
@@ -129,7 +140,7 @@ export class Composer {
   checking(from, after, note) {
     this.phase = "checking";
     this.note = note;
-    this.check = { from, after, until: after + CHECK_MS, seen: false };
+    this.check = { from, after, until: after + CHECK_MS };
   }
 
   /** Whether the text box takes typing. */
@@ -211,22 +222,19 @@ export class Composer {
       this.note = "";
       return "sent";
     }
-    if (startedAt >= this.check.after) {
-      this.check.seen = true;
-      this.note = NOTES.notYet;
-    }
+    if (startedAt >= this.check.after) this.note = NOTES.notYet;
     return "waiting";
   }
 
   /**
-   * The check's clock. "unconfirmed": 60 s passed with a poll that could
-   * have seen it and didn't; the box is editable again, and sending asks
-   * first.
+   * The check's clock. "unconfirmed": 60 s passed without finding it
+   * (polls that failed find nothing either); the box is editable again,
+   * and sending asks first.
    * @param {number} now
    * @returns {"unconfirmed" | null}
    */
   tick(now) {
-    if (this.phase !== "checking" || !this.check || now < this.check.until || !this.check.seen) return null;
+    if (this.phase !== "checking" || !this.check || now < this.check.until) return null;
     this.phase = "editing";
     this.unconfirmed = true;
     this.note = NOTES.unconfirmed;

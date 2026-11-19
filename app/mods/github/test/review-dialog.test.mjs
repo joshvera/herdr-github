@@ -133,7 +133,7 @@ test("not found in 60 s: could not confirm, and sending again needs a second pre
   const d = open(review(7));
   d.press(T0, false, "");
   d.outcome("unknown", null, "x", T0 + 1000);
-  assert.equal(d.tick(T0 + 1000 + CHECK_MS), null, "no poll has looked yet");
+  assert.equal(d.tick(T0 + 1000 + CHECK_MS - 1), null);
   d.poll({ review: review(7) }, T0 + 6000);
   assert.equal(d.tick(T0 + 1000 + CHECK_MS), "unconfirmed");
   assert.equal(d.note, DIALOG_NOTES.unconfirmed);

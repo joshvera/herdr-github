@@ -12,7 +12,7 @@
 //     │                                                 ▼
 //     │                      checking ── a poll after the send ended shows
 //     │                         │        it went through ──────────────► done
-//     │                         │ 60 s, and a poll that could have seen it
+//     │                         │ 60 s without finding it
 //     │                         ▼
 //     └──── unconfirmed choose ── cmd-enter ──► again ── cmd-enter ──► sending
 //
@@ -82,7 +82,7 @@ export class SubmitDialog {
     this.lastPress = -Infinity;
     /** @type {{ kind: "submit" | "discard", reviewId: string, count: number, at: number } | null} */
     this.sent = null;
-    /** @type {{ from: number, until: number, seen: boolean } | null} */
+    /** @type {{ from: number, until: number } | null} */
     this.check = null;
   }
 
@@ -282,7 +282,7 @@ export class SubmitDialog {
     }
     this.phase = "checking";
     this.note = DIALOG_NOTES.unknown;
-    this.check = { from: now, until: now + CHECK_MS, seen: false };
+    this.check = { from: now, until: now + CHECK_MS };
   }
 
   /**
@@ -310,20 +310,19 @@ export class SubmitDialog {
         return "sent";
       }
     }
-    this.check.seen = true;
     this.note = DIALOG_NOTES.notYet;
     return "waiting";
   }
 
   /**
-   * The check's clock: after 60 s with a poll that could have seen it,
-   * "Could not confirm", and the choice is the user's (never a resend by
-   * itself; sending again asks first).
+   * The check's clock: after 60 s without finding it, "Could not
+   * confirm", and the choice is the user's (never a resend by itself;
+   * sending again asks first).
    * @param {number} now
    * @returns {"unconfirmed" | null}
    */
   tick(now) {
-    if (this.phase !== "checking" || !this.check || now < this.check.until || !this.check.seen) return null;
+    if (this.phase !== "checking" || !this.check || now < this.check.until) return null;
     this.phase = "choose";
     this.unconfirmed = true;
     this.note = DIALOG_NOTES.unconfirmed;
