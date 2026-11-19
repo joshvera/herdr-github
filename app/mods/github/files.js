@@ -1,7 +1,8 @@
 // The PR screen's Files changed tab: the PR's changed files as a tree at the
 // left, one file's diff at the right with its review threads between the
-// lines they're on. Every move is one key. It reads; the one thing it changes
-// on GitHub is a file's viewed mark.
+// lines they're on. Every move is one key. What it changes on GitHub: a
+// file's viewed mark, and the review (x resolves a thread), each through
+// `send` or main's mutate, once.
 //
 // Everything shown is from one head commit (`files` names it). A diff is
 // asked for only once `files` has answered, one at a time, for that head:
@@ -29,6 +30,8 @@ import { treeRows, matchesPath, statusMark } from "./filetree.js";
 import { diffItems } from "./diffitems.js";
 import { TREE_ROW_H, treeRow, viewedMark, diffItem } from "./filesdraw.js";
 import { mergeThreads, countThreads, refind, shiftedAbove, PollHealth } from "./follow.js";
+import { MOVES, route, reviewAction } from "./reviewkeys.js";
+import { withResolved, checked } from "./sent.js";
 
 const TREE_W = 290;
 const FILTER_H = 30;
@@ -44,10 +47,6 @@ const NEW_COMMITS = "New commits pushed. r reloads.";
 
 // `files` and `diff` can take a while on a big PR (every REST page).
 const SLOW = { timeout: 120000 };
-
-// The keys a held key repeats. Anything else held does nothing: a repeat
-// comes faster than anyone sees what it did (v, enter, r, o).
-const MOVES = new Set(["j", "k", "down", "up", "]", "[", "n", "p"]);
 
 // A press that left the filter, coming again the other way (the Input's
 // submit and on_key_down, a binding and on_key_down): taken, once.
@@ -96,6 +95,8 @@ export class FilesView {
     this.held = new Map(); // id → until: sent from here, not yet read back (follow.js)
     this.topKey = null; // the first item the diff list drew: the scroll's anchor
     this.filesOwed = false; // a files answer was dropped: read again once nothing is sent
+    this.sending = false; // a review change is out (send): nothing else goes until it answers
+    this.checks = []; // changes whose outcome wasn't known: the next poll after `after` says (sent.js)
     this.path = null; // the open file
     this.at = 0; // the cursor: an index into items()
     this.target = null; // where the cursor goes once the open file's items come
@@ -372,7 +373,8 @@ export class FilesView {
     const stamp = this.app.gate.startPoll();
     if (stamp === null) return; // a change is out: asked again when it ends
     this.polling = true;
-    this.pollAt = Date.now() + POLL_MS;
+    const startedAt = Date.now();
+    this.pollAt = startedAt + POLL_MS;
     const head = this.data.head;
     cx.spawn(async (cx) => {
       let res = null;
@@ -395,6 +397,7 @@ export class FilesView {
       this.health.ok();
       if (this.data?.head !== head) return; // r read another head meanwhile
       this.applyThreads(res);
+      this.answerChecks(res, startedAt, cx);
       cx.notify();
     });
   }
@@ -407,11 +410,19 @@ export class FilesView {
       this.behind = true;
       return;
     }
-    const before = this.items();
-    const top = before ? Math.max(0, before.findIndex((it) => it.key === this.topKey)) : 0;
     const { threads, held } = mergeThreads(this.data.threads, res, this.held, Date.now());
     this.held = held;
-    this.data = { ...this.data, threads, files: countThreads(this.data.files, threads), more: this.data.more || Boolean(res.more) };
+    this.setThreads(threads, this.data.more || Boolean(res.more));
+  }
+
+  // Shows `threads` in place of the ones shown, moving nothing being read:
+  // the cursor stays on its item (or the row its thread sat under), and the
+  // first item in sight stays first. A poll's merge and every change sent
+  // from here come through it.
+  setThreads(threads, more = this.data.more) {
+    const before = this.items();
+    const top = before ? Math.max(0, before.findIndex((it) => it.key === this.topKey)) : 0;
+    this.data = { ...this.data, threads, files: countThreads(this.data.files, threads), more };
     this.indexThreads();
     const after = this.items();
     if (!before || !after) return;
@@ -419,18 +430,90 @@ export class FilesView {
     if (shiftedAbove(before, after, top)) this.ui.diffScroll.scroll_to_item(refind(before, after, top), "top");
   }
 
+  // A poll that started after a change with no known outcome ended says
+  // what happened to it (only for the head shown: a thread is by its id).
+  answerChecks(res, startedAt, cx) {
+    if (res.head !== this.data.head) return;
+    const due = this.checks.filter((c) => startedAt >= c.after);
+    if (!due.length) return;
+    this.checks = this.checks.filter((c) => startedAt < c.after);
+    const last = checked(due[due.length - 1], this.data.threads);
+    this.say(last.text, cx, last.err);
+  }
+
+  // ── changing the review ────────────────────────────────────────────────
+
+  // Every review change this tab makes goes through here, once: one at a
+  // time, refused at once (before anything is awaited) while another is out,
+  // so two deliveries of one press can't both send. `done` gets the
+  // outcome (mutation.js), also when the view is no longer the tab's.
+  send(req, cx, done) {
+    if (this.sending || !this.app.gate.clear()) {
+      this.say("Still sending the last change: one at a time.", cx, true);
+      return false;
+    }
+    this.sending = true;
+    cx.spawn(async (cx) => {
+      const r = await this.app.mutate({ ...req, pr: this.prID() });
+      this.sending = false;
+      done(r, cx);
+      cx.notify();
+    });
+    return true;
+  }
+
+  // A review key (reviewkeys.js): done, or why not said.
+  reviewKey(k, cx) {
+    const what = reviewAction(k, { state: this.state, follows: this.follows(), item: this.state === "ok" ? this.items()?.[this.at] : null });
+    if ("say" in what) return this.say(what.say, cx, true);
+    if (what.act === "resolve") this.resolve(what.thread, what.to, cx);
+  }
+
+  // x: resolves the thread, or unresolves it. Shown at once (its fold kept
+  // as it is), put back if GitHub says no; others see it at once.
+  resolve(t, to, cx) {
+    const word = to ? "Resolved" : "Unresolved";
+    const flip = (resolved) => {
+      if (!this.alive() || this.data.threads.every((x) => x.id !== t.id)) return;
+      this.setThreads(withResolved(this.data.threads, t.id, resolved));
+    };
+    const sent = this.send({ op: "act", do: to ? "resolve" : "unresolve", thread: t.id }, cx, (r, cx) => {
+      if (r.kind === "ok") {
+        flip(r.answer.resolved === true);
+        this.say(`${r.answer.resolved === true ? "Resolved" : "Unresolved"}. Others see it at once.`, cx);
+      } else if (r.kind === "refused") {
+        flip(!to);
+        this.say(r.error, cx, true);
+      } else {
+        // Left as asked: the next poll after this one ended shows the truth.
+        this.checks.push({ kind: "resolve", thread: t.id, want: to, after: Date.now() });
+        this.say("No answer. Checking…", cx, true);
+      }
+    });
+    if (!sent) return;
+    this.fold.set(t.id, this.folded(t));
+    this.foldN++;
+    flip(to);
+    this.say(`${word}: sending. Others see it at once.`, cx);
+  }
+
   // ── keys ───────────────────────────────────────────────────────────────
 
   // A key on this tab, before the PR screen's own: true when it's taken
   // here. Declined: 1 2 3, tab, shift-tab, esc, left, backspace (tabs and
-  // back), o y (link()), r (reload()); m d w s a l c x h, which do nothing.
+  // back), o y (link()), r (reload()); m d w s a l c h, which do nothing.
+  // x is taken whatever the state, so it can say why it can't act.
   key(k, cx, held = false) {
     // Only tab and shift-tab come here while the filter has the keyboard
     // (main's keyDown sends it the rest): they don't navigate.
-    if (this.typing) return true;
-    if (held && !MOVES.has(k)) return true;
+    const to = route({ keyboard: this.typing ? "filter" : "view" }, k, held);
+    if (to === "type" || to === "swallow") return true;
     // The second delivery of the enter that left the filter.
     if (k === "enter" && Date.now() - this.leftAt < SAME_PRESS_MS) return true;
+    if (to === "review") {
+      this.reviewKey(k, cx);
+      return true;
+    }
     if (this.state !== "ok") return false;
     switch (k) {
       case "j":
@@ -689,12 +772,24 @@ export class FilesView {
         k(["enter"], "fold", (cx) => this.toggleFold(cx), "f-fold"),
         k(["/"], "filter", (cx) => this.startFilter(cx), "f-filter"),
       );
+      out.push(...this.reviewFooter(k));
     }
     out.push(
       k(["o"], "GitHub", (cx) => this.app.open(this.link(), cx), "f-o"),
       k(["y"], "copy link", (cx) => this.app.copy(this.link(), cx), "f-y"),
     );
     if (this.state === "ok" || this.state === "error") out.push(k(["r"], "reload", (cx) => this.app.reload(cx), "f-r"));
+    return out;
+  }
+
+  // The review keys that apply to what the cursor is on.
+  reviewFooter(k) {
+    const t = this.items()?.[this.at]?.t;
+    if (!t || !this.follows() || t.local) return [];
+    const out = [];
+    if (t.resolved ? t.canUnresolve : t.canResolve) {
+      out.push(k(["x"], `${t.resolved ? "unresolve" : "resolve"} (others see it)`, (cx) => this.reviewKey("x", cx), "f-x"));
+    }
     return out;
   }
 
