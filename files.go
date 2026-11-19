@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -26,13 +27,37 @@ const (
 // threadsAnswer is the `threads` op's answer, the cheap poll: the PR's
 // review threads and the viewer's pending review, from one head.
 type threadsAnswer struct {
-	Head   string      `json:"head"`
-	PR     prInfo      `json:"pr"`
-	Review *reviewInfo `json:"review"` // the viewer's pending review; null when there's none
-	// The viewer's latest submitted review; null when there's none.
-	Submitted *submittedInfo `json:"submitted"`
-	Threads   []fileThread   `json:"threads"`
-	More      bool           `json:"more"` // there's more than was fetched: counts are lower bounds
+	Head string `json:"head"`
+	PR   prInfo `json:"pr"`
+	// The viewer's pending review; null when there's none, left out when
+	// GitHub didn't say (a partial answer).
+	Review answered[reviewInfo] `json:"review,omitzero"`
+	// The viewer's latest submitted review; null when there's none, left
+	// out when GitHub didn't say.
+	Submitted answered[submittedInfo] `json:"submitted,omitzero"`
+	Threads   []fileThread            `json:"threads"`
+	More      bool                    `json:"more"` // there's more than was fetched: counts are lower bounds
+}
+
+// answered is what a read said of one thing: Val, nil for none, when Known.
+// Not known (a partial answer whose read of it came back null) leaves its
+// key out of the answer, so the mod keeps what it had; a null would say
+// there's none, and "your pending review is gone" reads as "submitted".
+type answered[T any] struct {
+	Val   *T
+	Known bool
+}
+
+func known[T any](v *T) answered[T] { return answered[T]{Val: v, Known: true} }
+
+func (a answered[T]) IsZero() bool { return !a.Known }
+
+func (a answered[T]) MarshalJSON() ([]byte, error) { return json.Marshal(a.Val) }
+
+// UnmarshalJSON: a key that's there is known, null or not.
+func (a *answered[T]) UnmarshalJSON(b []byte) error {
+	a.Known = true
+	return json.Unmarshal(b, &a.Val)
 }
 
 // filesAnswer is the `files` op's answer: what `threads` has, and the files.
@@ -304,8 +329,8 @@ const filesQuery = `query($owner: String!, $name: String!, $n: Int!, $review: Bo
 type prFiles struct {
 	ID, Head  string
 	PR        prInfo
-	Review    *reviewInfo
-	Submitted *submittedInfo
+	Review    answered[reviewInfo]
+	Submitted answered[submittedInfo]
 	Files     []gqlFile
 	Threads   []gqlThread
 	More      bool
@@ -376,11 +401,13 @@ func (c *ghClient) loadFilesOnce(ctx context.Context, r repoRef, number int, wit
 		if round == 0 {
 			out.ID, out.Head = pr.ID, pr.HeadRefOid
 			out.PR = prInfo{ID: pr.ID, Mine: pr.ViewerDidAuthor, State: strings.ToLower(pr.State)}
+			// Null only in a partial answer (asked for, so a full answer
+			// has them): then not known, rather than none.
 			if pr.Reviews != nil {
-				out.Review = pendingOf(pr.Reviews.Nodes)
+				out.Review = known(pendingOf(pr.Reviews.Nodes))
 			}
 			if pr.Submitted != nil {
-				out.Submitted = submittedOf(pr.Submitted.Nodes)
+				out.Submitted = known(submittedOf(pr.Submitted.Nodes))
 			}
 		} else if pr.HeadRefOid != out.Head {
 			return nil, errMoved

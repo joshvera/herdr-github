@@ -31,6 +31,9 @@ type fakePR struct {
 	mine      bool
 	reviews   []map[string]any
 	submitted []map[string]any // what reviews(last: 10) says
+	// Both review reads come back null (GitHub's errors say why), as in a
+	// partial answer.
+	reviewsNull bool
 }
 
 func (p *fakePR) handler() http.HandlerFunc {
@@ -68,6 +71,9 @@ func (p *fakePR) handler() http.HandlerFunc {
 			pr["viewerDidAuthor"], pr["state"] = p.mine, "OPEN"
 			pr["reviews"] = map[string]any{"nodes": append([]map[string]any{}, p.reviews...)}
 			pr["submitted"] = map[string]any{"nodes": append([]map[string]any{}, p.submitted...)}
+			if p.reviewsNull {
+				pr["reviews"], pr["submitted"] = nil, nil
+			}
 		}
 		if req.Variables["files"] == true {
 			pr["files"] = page(p.files, req.Variables["fa"])
@@ -449,7 +455,7 @@ func TestFilesCarryTheReviewAndPermissions(t *testing.T) {
 	if want := (prInfo{ID: "PR_x", Mine: true, State: "open"}); got.PR != want {
 		t.Fatalf("pr %+v", got.PR)
 	}
-	if want := (reviewInfo{ID: "PRR_mine", Body: "overall\nthoughts", Comments: 3, Commit: headB}); got.Review == nil || *got.Review != want {
+	if want := (reviewInfo{ID: "PRR_mine", Body: "overall\nthoughts", Comments: 3, Commit: headB}); got.Review.Val == nil || *got.Review.Val != want {
 		t.Fatalf("review %+v", got.Review)
 	}
 	th := got.Threads[0]
@@ -503,7 +509,7 @@ func TestOpThreads(t *testing.T) {
 		}
 	}
 	typed := demoRunAs[threadsAnswer](t, `{"op":"threads",`+opPR+`}`)
-	if typed.Head != headA || typed.Review == nil || typed.Review.ID != "PRR_mine" || len(typed.Threads) != 2 || typed.Threads[0].ID != "T1" {
+	if typed.Head != headA || typed.Review.Val == nil || typed.Review.Val.ID != "PRR_mine" || len(typed.Threads) != 2 || typed.Threads[0].ID != "T1" {
 		t.Fatalf("%+v", typed)
 	}
 	if len(pr.queries) != 2 || pr.headQs != 0 {
@@ -536,7 +542,7 @@ func TestThreadsCarryTheViewersLatestSubmittedReview(t *testing.T) {
 	fakeGitHubREST(t, pr.handler(), nil)
 	got := demoRunAs[threadsAnswer](t, `{"op":"threads",`+opPR+`}`)
 	want := submittedInfo{ID: "PRR_late", State: "approved", At: time.Date(2026, 11, 19, 10, 0, 5, 0, time.UTC).UnixMilli()}
-	if got.Submitted == nil || *got.Submitted != want {
+	if got.Submitted.Val == nil || *got.Submitted.Val != want {
 		t.Fatalf("submitted %+v", got.Submitted)
 	}
 	q := pr.queries[0].Query
@@ -547,6 +553,37 @@ func TestThreadsCarryTheViewersLatestSubmittedReview(t *testing.T) {
 	pr.submitted = []map[string]any{submittedNode("PRR_pending", "PENDING", true, nil), submittedNode("PRR_theirs", "COMMENTED", false, "2026-11-19T11:00:00Z")}
 	raw := opRun(t, `{"op":"threads",`+opPR+`}`)
 	if v, ok := raw["submitted"]; !ok || v != nil {
+		t.Fatalf("submitted %v (present %v)", v, ok)
+	}
+}
+
+// A partial answer whose review reads came back null says nothing of the
+// pending or submitted review: both keys are left out, so the mod keeps what
+// it had. A null would read as "no pending review", and so as "submitted".
+func TestThreadsLeaveOutReviewsAPartialAnswerDidntGive(t *testing.T) {
+	cacheFixture(t)
+	pr := &fakePR{t: t, head: staticHead(headA), reviewsNull: true}
+	pr.reviews = []map[string]any{reviewNode("PRR_mine", "PENDING", true, 3, headA)}
+	pr.errors = []map[string]any{{"type": "INTERNAL", "message": "reviews timed out", "path": []any{"repository", "pullRequest", "reviews"}}}
+	fakeGitHubREST(t, pr.handler(), nil)
+	// (`files` answers through the same threadsFrom.)
+	got := opRun(t, `{"op":"threads",`+opPR+`}`)
+	for _, k := range []string{"review", "submitted"} {
+		if v, ok := got[k]; ok {
+			t.Fatalf("%s is %v, but GitHub didn't say", k, v)
+		}
+	}
+	if got["more"] != true || got["head"] != headA {
+		t.Fatalf("%v", got)
+	}
+
+	// Answered, even with errors elsewhere: there, and null when there's none.
+	pr.reviewsNull = false
+	got = opRun(t, `{"op":"threads",`+opPR+`}`)
+	if rv, ok := got["review"].(map[string]any); !ok || rv["id"] != "PRR_mine" {
+		t.Fatalf("review %v", got["review"])
+	}
+	if v, ok := got["submitted"]; !ok || v != nil {
 		t.Fatalf("submitted %v (present %v)", v, ok)
 	}
 }

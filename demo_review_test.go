@@ -38,8 +38,8 @@ func TestAppDemoReviewFields(t *testing.T) {
 	if want := (prInfo{ID: "PR_demo_482", Mine: true, State: "open"}); got.PR != want {
 		t.Fatalf("pr %+v", got.PR)
 	}
-	if want := (reviewInfo{ID: "PRR_demo_482", Comments: 1, Commit: demoHead(482)}); got.Review == nil || *got.Review != want {
-		t.Fatalf("review %+v", got.Review)
+	if want := (reviewInfo{ID: "PRR_demo_482", Comments: 1, Commit: demoHead(482)}); got.Review.Val == nil || *got.Review.Val != want {
+		t.Fatalf("review %+v", got.Review.Val)
 	}
 	open := demoThreadByID(t, got.threadsAnswer, "PRRT_demo_1")
 	pendingOnly := demoThreadByID(t, got.threadsAnswer, "PRRT_demo_3")
@@ -53,8 +53,8 @@ func TestAppDemoReviewFields(t *testing.T) {
 	}
 	// Maria's PR: not Sam's, with Sam's pending review a commit behind.
 	other := demoRunAs[filesAnswer](t, `{"op":"files","demo":true,`+demoPR480+`}`)
-	if other.PR.Mine || other.Review == nil || other.Review.Commit != demoOldHead(480) || other.Review.Comments != 1 {
-		t.Fatalf("#480 %+v %+v", other.PR, other.Review)
+	if other.PR.Mine || other.Review.Val == nil || other.Review.Val.Commit != demoOldHead(480) || other.Review.Val.Comments != 1 {
+		t.Fatalf("#480 %+v %+v", other.PR, other.Review.Val)
 	}
 }
 
@@ -73,8 +73,8 @@ func TestAppDemoReviewActionsStay(t *testing.T) {
 	if th := demoThreadByID(t, files.threadsAnswer, c.Thread.ID); th.Line != 142 || th.Side != "right" || th.Path != engine {
 		t.Fatalf("the new thread %+v", th)
 	}
-	if files.Review.Comments != 2 {
-		t.Fatalf("review %+v", files.Review)
+	if files.Review.Val.Comments != 2 {
+		t.Fatalf("review %+v", files.Review.Val)
 	}
 
 	r := demoRunAs[replyAnswer](t, demoDo(demoPR482, "reply", map[string]any{"thread": "PRRT_demo_1", "body": "Also: retries?"}))
@@ -105,8 +105,8 @@ func TestAppDemoReviewActionsStay(t *testing.T) {
 		t.Fatalf("submit %+v", s)
 	}
 	after := demoFilesReq(t)
-	if after.Review != nil {
-		t.Fatalf("still pending: %+v", after.Review)
+	if after.Review.Val != nil {
+		t.Fatalf("still pending: %+v", after.Review.Val)
 	}
 	for _, th := range after.Threads {
 		for _, cm := range th.Comments {
@@ -157,8 +157,8 @@ func TestAppDemoReviewRefusals(t *testing.T) {
 			}
 		}
 	}
-	if after := demoFilesReq(t); len(after.Threads) != len(before.Threads) || *after.Review != *before.Review {
-		t.Fatalf("a refusal changed something: %+v", after.Review)
+	if after := demoFilesReq(t); len(after.Threads) != len(before.Threads) || *after.Review.Val != *before.Review.Val {
+		t.Fatalf("a refusal changed something: %+v", after.Review.Val)
 	}
 }
 
@@ -169,15 +169,15 @@ func TestAppDemoReviewGrows(t *testing.T) {
 	poll := func() threadsAnswer { return demoRunAs[threadsAnswer](t, `{"op":"threads","demo":true,`+demoPR482+`}`) }
 	var counts []int
 	for i := 0; i < 4; i++ {
-		counts = append(counts, poll().Review.Comments)
+		counts = append(counts, poll().Review.Val.Comments)
 	}
 	if want := []int{2, 3, 3, 3}; counts[0] != want[0] || counts[1] != want[1] || counts[3] != want[3] {
 		t.Fatalf("counts %v", counts)
 	}
 	// What arrived is in `files` too, on rows of the diff.
 	files := demoFilesReq(t)
-	if files.Review.Comments != 3 || len(files.Threads) != 7 {
-		t.Fatalf("%+v, %d threads", files.Review, len(files.Threads))
+	if files.Review.Val.Comments != 3 || len(files.Threads) != 7 {
+		t.Fatalf("%+v, %d threads", files.Review.Val, len(files.Threads))
 	}
 	for _, th := range files.Threads {
 		if th.Line == 0 {
@@ -226,8 +226,8 @@ func TestAppDemoDeleteAndReplyWithNoReview(t *testing.T) {
 		t.Fatalf("%v", got)
 	}
 	files := demoFilesReq(t)
-	if files.Review != nil {
-		t.Fatalf("review %+v", files.Review)
+	if files.Review.Val != nil {
+		t.Fatalf("review %+v", files.Review.Val)
 	}
 	for _, th := range files.Threads {
 		if th.ID == "PRRT_demo_3" {
@@ -254,8 +254,8 @@ func TestAppDemoDiscardThenApprove(t *testing.T) {
 		t.Fatalf("%v", got)
 	}
 	files := demoRunAs[filesAnswer](t, `{"op":"files","demo":true,`+demoPR480+`}`)
-	if files.Review != nil || len(files.Threads) != 0 {
-		t.Fatalf("%+v %+v", files.Review, files.Threads)
+	if files.Review.Val != nil || len(files.Threads) != 0 {
+		t.Fatalf("%+v %+v", files.Review.Val, files.Threads)
 	}
 	s := demoRunAs[submitAnswer](t, demoDo(demoPR480, "submit", map[string]any{"event": "approve"}))
 	if !s.OK || s.URL == "" {
@@ -292,33 +292,33 @@ func TestAppDemoSubmittedReview(t *testing.T) {
 	threads := func(pr string) threadsAnswer {
 		return demoRunAs[threadsAnswer](t, `{"op":"threads","demo":true,`+pr+`}`)
 	}
-	if got := threads(demoPR480); got.Submitted != nil {
-		t.Fatalf("submitted before any submit: %+v", got.Submitted)
+	if got := threads(demoPR480); got.Submitted.Val != nil {
+		t.Fatalf("submitted before any submit: %+v", got.Submitted.Val)
 	}
 	appRun(t, demoDo(demoPR480, "discard", map[string]any{"reviewId": "PRR_demo_480", "count": 1}))
 	if got := appRun(t, demoDo(demoPR480, "submit", map[string]any{"event": "approve", "body": demoUnknown})); got["unknown"] != true {
 		t.Fatalf("%v", got)
 	}
-	if got := threads(demoPR480); got.Submitted != nil {
+	if got := threads(demoPR480); got.Submitted.Val != nil {
 		t.Fatalf("!unknown recorded a review: %+v", got.Submitted)
 	}
 	if got := appRun(t, demoDo(demoPR480, "submit", map[string]any{"event": "approve", "body": demoUnknownSent})); got["unknown"] != true {
 		t.Fatalf("%v", got)
 	}
 	got := threads(demoPR480)
-	if got.Submitted == nil || got.Submitted.State != "approved" || got.Submitted.ID == "" || got.Submitted.At == 0 {
+	if got.Submitted.Val == nil || got.Submitted.Val.State != "approved" || got.Submitted.Val.ID == "" || got.Submitted.Val.At == 0 {
 		t.Fatalf("submitted %+v", got.Submitted)
 	}
-	first := got.Submitted.ID
+	first := got.Submitted.Val.ID
 	// Sam's own review on #482, by its id.
 	s := demoRunAs[submitAnswer](t, demoDo(demoPR482, "submit", map[string]any{"reviewId": "PRR_demo_482", "count": 1, "event": "comment"}))
 	if !s.OK {
 		t.Fatalf("%+v", s)
 	}
-	if got := threads(demoPR482); got.Submitted == nil || got.Submitted.ID != "PRR_demo_482" || got.Submitted.State != "commented" || got.Review != nil {
+	if got := threads(demoPR482); got.Submitted.Val == nil || got.Submitted.Val.ID != "PRR_demo_482" || got.Submitted.Val.State != "commented" || got.Review.Val != nil {
 		t.Fatalf("%+v %+v", got.Submitted, got.Review)
 	}
-	if got := threads(demoPR480); got.Submitted == nil || got.Submitted.ID != first {
+	if got := threads(demoPR480); got.Submitted.Val == nil || got.Submitted.Val.ID != first {
 		t.Fatalf("#480's submitted changed: %+v", got.Submitted)
 	}
 }

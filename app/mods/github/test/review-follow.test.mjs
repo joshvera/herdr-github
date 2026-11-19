@@ -1,7 +1,7 @@
 // Following the PR: merging a poll without moving the reader (follow.js).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mergeThreads, countThreads, refind, shiftedAbove, reviewChip, PollHealth, HOLD_MS } from "../follow.js";
+import { mergeThreads, countThreads, refind, shiftedAbove, reviewChip, PollHealth, HOLD_MS, reviewsOf } from "../follow.js";
 import { diffItems } from "../diffitems.js";
 
 const NOW = 1_800_000_000_000;
@@ -96,4 +96,13 @@ test("a failed poll shows nothing until three in a row", () => {
   assert.equal(h.error, "GitHub: HTTP 502");
   h.ok();
   assert.equal(h.error, "");
+});
+
+test("an answer that leaves the review out (GitHub didn't say) keeps what was known; only null means none", () => {
+  const prev = { review: { id: "PRR_1", comments: 7 }, submitted: { id: "PRR_0", at: 1 } };
+  assert.deepEqual(reviewsOf({ head: "h", threads: [], more: true }, prev), prev);
+  assert.deepEqual(reviewsOf({ review: null, submitted: null }, prev), { review: null, submitted: null });
+  const next = { review: { id: "PRR_1", comments: 8 }, submitted: { id: "PRR_2", at: 2 } };
+  assert.deepEqual(reviewsOf(next, prev), next);
+  assert.deepEqual(reviewsOf({ review: null }, prev), { review: null, submitted: prev.submitted }, "an older binary with no submitted");
 });

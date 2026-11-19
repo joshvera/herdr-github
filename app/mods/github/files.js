@@ -31,7 +31,7 @@ import { icon, tint, MONO } from "./look.js";
 import { treeRows, matchesPath, statusMark } from "./filetree.js";
 import { diffItems } from "./diffitems.js";
 import { TREE_ROW_H, treeRow, viewedMark, diffItem } from "./filesdraw.js";
-import { mergeThreads, countThreads, refind, shiftedAbove, PollHealth, HOLD_MS } from "./follow.js";
+import { mergeThreads, countThreads, refind, shiftedAbove, PollHealth, HOLD_MS, reviewsOf } from "./follow.js";
 import { route, reviewAction, deletePrompt, latestMine, NEW_COMMITS, OLDER_COMMIT } from "./reviewkeys.js";
 import { withResolved, withComment, withReply, withEdit, withoutComment, withoutPending, checked, CHECK_MS } from "./sent.js";
 import { DraftStore, DRAFTS_KEY, DEMO_DRAFTS_KEY, SAVE_MS, draftId, makeDraft, rowOf, rowTarget, placeDrafts, unplaced, droppedNote } from "./drafts.js";
@@ -309,8 +309,7 @@ export class FilesView {
       }
       this.data = { head: res.head, files: res.files ?? [], threads: res.threads ?? [], more: Boolean(res.more) };
       this.indexThreads();
-      this.review = res.review ?? null;
-      this.submitted = res.submitted ?? null;
+      ({ review: this.review, submitted: this.submitted } = reviewsOf(res, this));
       this.prInfo = res.pr ?? null;
       this.behind = false;
       this.health.ok();
@@ -463,8 +462,7 @@ export class FilesView {
 
   // A `threads` answer into what's shown, moving nothing being read.
   applyThreads(res) {
-    this.review = res.review ?? null;
-    this.submitted = res.submitted ?? null;
+    ({ review: this.review, submitted: this.submitted } = reviewsOf(res, this));
     if (res.pr) this.prInfo = res.pr;
     if (res.head !== this.data.head) {
       this.behind = true;
@@ -924,8 +922,9 @@ export class FilesView {
   checkDialog(res, startedAt, cx) {
     const d = this.dialog;
     if (!d) return;
-    d.follow(res.review ?? null, res.submitted ?? null, Date.now());
-    if (d.poll({ review: res.review ?? null, submitted: res.submitted ?? null }, startedAt) === "sent") {
+    // Left out (undefined): GitHub didn't say, and nothing follows from it.
+    d.follow(res.review, res.submitted, Date.now());
+    if (d.poll({ review: res.review, submitted: res.submitted }, startedAt) === "sent") {
       this.reviewDone(d.sent.kind, "", cx, d.note || "");
     }
   }

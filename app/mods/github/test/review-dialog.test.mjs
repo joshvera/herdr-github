@@ -164,3 +164,60 @@ test("the count follows a poll while the dialog is open, and says when the revie
   assert.equal(d.pick, "comment", "nothing left to discard");
   assert.equal(d.flashing(T0 + 10000), "");
 });
+
+// Picks discard and starts the discard step.
+const startDiscard = (d, t = T0) => {
+  d.pick = "discard";
+  assert.deepEqual(d.press(t, false, ""), { do: "focus-choices" });
+  assert.equal(d.phase, "discard");
+};
+
+test("a poll that changes the count during the discard step cancels it: the line said 7, so 9 is never sent", () => {
+  const d = open(review(7));
+  startDiscard(d);
+  for (const k of "discar") d.key(k, false, "", T0 + 1000);
+  d.follow(review(9), null, T0 + 2000);
+  assert.equal(d.phase, "choose", "the step said 7 comments");
+  assert.equal(d.typed, "");
+  assert.equal(d.flashing(T0 + 2000), "Now 9");
+  d.key("d", false, "", T0 + 3000);
+  assert.notEqual(d.key("enter", false, "", T0 + 3000).do, "send", "the rest of the word sends nothing");
+});
+
+test("a poll that swaps the review during the discard step cancels it too", () => {
+  const d = open(review(7));
+  startDiscard(d);
+  d.follow(review(7, "PRR_2"), null, T0 + 2000);
+  assert.equal(d.phase, "choose");
+  assert.equal(d.reviewId, "PRR_2");
+});
+
+test("discard again after an unknown discard asks first, then still needs the word typed", () => {
+  const d = open(review(7));
+  startDiscard(d);
+  for (const k of "discard") d.key(k, false, "", T0);
+  assert.equal(d.key("enter", false, "", T0).do, "send");
+  d.outcome("unknown", null, "x", T0 + 1000);
+  d.poll({ review: review(7) }, T0 + 6000);
+  d.tick(T0 + 1000 + CHECK_MS);
+  assert.equal(d.pick, "discard");
+  assert.deepEqual(d.press(T0 + 70000, false, ""), { do: "focus-choices" });
+  assert.equal(d.phase, "again", "Send again? comes before the discard step");
+  assert.equal(d.note, DIALOG_NOTES.again);
+  assert.deepEqual(d.key("cmd-enter", false, "", T0 + 71000), { do: "focus-choices" }, "then the discard step, not a send");
+  assert.equal(d.phase, "discard");
+  for (const k of "discard") d.key(k, false, "", T0 + 72000);
+  assert.deepEqual(d.key("enter", false, "", T0 + 72000), { do: "send", req: { op: "act", do: "discard", reviewId: "PRR_1", count: 7 } });
+});
+
+test("a poll that didn't say what the review is (left out) changes nothing, and never reads as sent", () => {
+  const d = open(review(7), false, { id: "PRR_old", at: T0 - 1000 });
+  d.follow(undefined, undefined, T0);
+  assert.equal(d.count, 7);
+  assert.equal(d.reviewId, "PRR_1");
+  assert.equal(d.flashing(T0), "");
+  d.press(T0 + 1000, false, "");
+  d.outcome("unknown", null, "x", T0 + 2000);
+  assert.equal(d.poll({ review: undefined, submitted: undefined }, T0 + 3000), "waiting", "not known isn't gone");
+  assert.equal(d.phase, "checking");
+});

@@ -140,3 +140,18 @@ export class PollHealth {
     if (this.fails >= 3) this.error = error;
   }
 }
+
+/**
+ * The pending review and the viewer's latest submitted review a `files` or
+ * `threads` answer says. Either left out (a partial answer: GitHub didn't
+ * say) keeps what was known; only null says there's none. Read as none, an
+ * unanswered review would be "gone", and so "submitted".
+ * @param {{ review?: any, submitted?: any }} res
+ * @param {{ review: any, submitted: any }} prev
+ */
+export function reviewsOf(res, prev) {
+  return {
+    review: "review" in res ? res.review ?? null : prev.review,
+    submitted: "submitted" in res ? res.submitted ?? null : prev.submitted,
+  };
+}

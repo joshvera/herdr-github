@@ -128,7 +128,8 @@ func (d *demoSource) shownThread(t fileThread) fileThread {
 // threadsOf is a demo PR's threads, the PR, and the viewer's pending review.
 // Callers hold d.mu.
 func (d *demoSource) threadsOf(p *prDetail) threadsAnswer {
-	out := threadsAnswer{Head: p.HeadRefOid, PR: prInfo{ID: p.ID, Mine: p.author() == d.me, State: strings.ToLower(p.State)}, Threads: []fileThread{}}
+	out := threadsAnswer{Head: p.HeadRefOid, PR: prInfo{ID: p.ID, Mine: p.author() == d.me, State: strings.ToLower(p.State)},
+		Review: known[reviewInfo](nil), Submitted: known[submittedInfo](nil), Threads: []fileThread{}}
 	data := d.filesData[p.key()]
 	if data == nil {
 		return out
@@ -136,8 +137,8 @@ func (d *demoSource) threadsOf(p *prDetail) threadsAnswer {
 	for _, t := range data.threads {
 		out.Threads = append(out.Threads, d.shownThread(t))
 	}
-	out.Review = data.pendingInfo()
-	out.Submitted = data.submitted
+	out.Review = known(data.pendingInfo())
+	out.Submitted = known(data.submitted)
 	return out
 }
 

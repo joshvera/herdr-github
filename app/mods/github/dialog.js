@@ -15,6 +15,7 @@
 //     │                         │ 60 s without finding it
 //     │                         ▼
 //     └──── unconfirmed choose ── cmd-enter ──► again ── cmd-enter ──► sending
+//                                                    (a discard: the discard step)
 //
 // The count sent is the count shown at the press; a poll may change it
 // while the dialog is open (the one thing a poll may change here), and says
@@ -116,13 +117,17 @@ export class SubmitDialog {
   /**
    * A poll's review (and the viewer's latest submitted one), while the
    * dialog is open: the count follows it, and says so when it changes.
-   * @param {Review} review
-   * @param {Submitted} submitted
+   * Either left out (undefined) means the poll didn't say: kept as it was.
+   * Any change during the discard step cancels it: the step said what it
+   * would discard, so the word is typed again for what's there now.
+   * @param {Review | undefined} review
+   * @param {Submitted | undefined} submitted
    * @param {number} now
    */
   follow(review, submitted, now) {
     if (this.phase === "sending" || this.phase === "checking" || this.phase === "done") return;
     if (submitted !== undefined) this.lastSubmitted = submitted?.id ?? "";
+    if (review === undefined) return;
     const id = review?.id ?? "";
     const n = review?.comments ?? 0;
     if (id === this.reviewId && n === this.count) return;
@@ -130,10 +135,8 @@ export class SubmitDialog {
     this.flashUntil = now + FLASH_MS;
     this.reviewId = id;
     this.count = n;
-    if (this.pick === "discard" && !id) {
-      this.pick = "comment";
-      if (this.phase === "discard") this.cancelDiscard();
-    }
+    if (this.phase === "discard") this.cancelDiscard();
+    if (this.pick === "discard" && !id) this.pick = "comment";
   }
 
   /** The flash, while it lasts. */
@@ -227,22 +230,30 @@ export class SubmitDialog {
     const gap = now - this.lastPress;
     this.lastPress = now;
     if (held === true || gap < SAME_PRESS_MS || (held === null && gap < REPEAT_MS)) return NONE;
-    if (this.phase === "again") return this.go("submit", body, now);
+    if (this.phase === "again") {
+      if (this.pick !== "discard") return this.go("submit", body, now);
+      this.note = DIALOG_NOTES.unconfirmed;
+      return this.startDiscard();
+    }
     if (this.phase !== "choose") return NONE;
     if (!this.offered(body).some((x) => x.id === this.pick)) return { do: "say", text: this.whyNot(this.pick) };
-    if (this.pick === "discard") {
-      this.phase = "discard";
-      this.typed = "";
-      this.focus = "choices";
-      return { do: "focus-choices" };
-    }
+    // After an unknown outcome, "Send again?" comes first, discard or not;
+    // a discard then still needs its word typed.
     if (this.unconfirmed) {
       this.phase = "again";
       this.note = DIALOG_NOTES.again;
       this.focus = "choices";
       return { do: "focus-choices" };
     }
+    if (this.pick === "discard") return this.startDiscard();
     return this.go("submit", body, now);
+  }
+
+  startDiscard() {
+    this.phase = "discard";
+    this.typed = "";
+    this.focus = "choices";
+    return { do: "focus-choices" };
   }
 
   // Sends: the review shown, and the count shown at this moment.
@@ -289,7 +300,8 @@ export class SubmitDialog {
    * A poll, while checking: "sent" when it shows the send went through,
    * "waiting", or null (not checking, or the poll began before the send
    * ended).
-   * @param {{ review: Review, submitted?: Submitted }} answer
+   * Left out (undefined), the poll didn't say: waiting, never "sent".
+   * @param {{ review?: Review, submitted?: Submitted }} answer
    * @param {number} startedAt
    * @returns {"sent" | "waiting" | null}
    */
@@ -297,7 +309,7 @@ export class SubmitDialog {
     if (this.phase !== "checking" || !this.check || startedAt < this.check.from) return null;
     const s = this.sent;
     if (s.reviewId) {
-      if (!answer.review || answer.review.id !== s.reviewId) {
+      if (answer.review !== undefined && (!answer.review || answer.review.id !== s.reviewId)) {
         this.phase = "done";
         this.note = DIALOG_NOTES.gone;
         return "sent";
