@@ -523,11 +523,14 @@ func TestOpSubmitThePendingReview(t *testing.T) {
 // as it is now, and nothing sent.
 func TestOpSubmitAndDiscardRefuseAChangedReview(t *testing.T) {
 	for name, pending := range map[string]map[string]any{
-		"count":     reviewNode("PRR_mine", "PENDING", true, 4, headA),
-		"replaced":  reviewNode("PRR_other", "PENDING", true, 3, headA),
-		"gone":      nil,
-		"submitted": nil,
+		"count":    reviewNode("PRR_mine", "PENDING", true, 4, headA),
+		"replaced": reviewNode("PRR_other", "PENDING", true, 3, headA),
+		"gone":     nil,
+		// Submitted elsewhere: GitHub's answer still has it, but it's no
+		// longer pending, so there's no pending review.
+		"submitted": reviewNode("PRR_mine", "SUBMITTED", true, 3, headA),
 	} {
+		gone := name == "gone" || name == "submitted"
 		for _, req := range []string{submitReq("PRR_mine", intp(3), "comment", "lgtm"), doReq("discard", map[string]any{"reviewId": "PRR_mine", "count": 3})} {
 			t.Run(name, func(t *testing.T) {
 				f := reviewOpFixture(t)
@@ -537,7 +540,7 @@ func TestOpSubmitAndDiscardRefuseAChangedReview(t *testing.T) {
 					t.Fatalf("%v", got)
 				}
 				v, present := got["review"]
-				if !present || (pending == nil) != (v == nil) {
+				if !present || gone != (v == nil) {
 					t.Fatalf("review %v (present %v)", v, present)
 				}
 				if name == "count" && got["error"] != "Your pending review changed (now 4 comments). Nothing was sent." {
