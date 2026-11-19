@@ -86,6 +86,15 @@ test("a check reads the poll's own threads, and waits when the poll can't say (m
   assert.deepEqual(answerChecks([res], { ...poll, more: true }, new Map(), 200), { said: null, left: [res] });
 });
 
+test("an unknown delete of a comment not read back yet waits: a poll lagging its creation can't say it's gone", () => {
+  const poll = { threads: [thread("T1", [comment("C1")])], more: false };
+  const del = { kind: "delete", comment: "C9", after: 100, unreadUntil: 500 };
+  assert.deepEqual(answerChecks([del], poll, new Map(), 200), { said: null, left: [del] }, "C9 was held when the poll began");
+  assert.deepEqual(answerChecks([del], poll, new Map(), 600).said, { text: "It went through: deleted.", err: false }, "the hold had run out");
+  const there = { threads: [thread("T1", [comment("C1"), comment("C9")])], more: false };
+  assert.equal(answerChecks([del], there, new Map(), 200).said.err, true, "seen: it's GitHub's word");
+});
+
 test("an unknown viewed mark stays as asked; only a refusal puts it back", () => {
   assert.equal(viewedAfter("ok", "unviewed", "viewed"), "viewed");
   assert.equal(viewedAfter("refused", "unviewed", "viewed"), "unviewed");

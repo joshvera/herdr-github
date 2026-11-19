@@ -587,7 +587,7 @@ export class FilesView {
       } else if (r.kind === "refused") {
         this.say(r.error, cx, true);
       } else {
-        this.checks.push({ kind: "delete", comment: comment.id, after: Date.now() });
+        this.checks.push({ kind: "delete", comment: comment.id, unreadUntil: until, after: Date.now() });
         this.say("No answer. Checking…", cx, true);
       }
     });

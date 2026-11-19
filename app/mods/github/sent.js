@@ -77,7 +77,9 @@ export function withoutPending(threads) {
 export const CHECK_MS = 60000;
 //
 //   { kind: "resolve", thread, want }  the thread's resolved state now
-//   { kind: "delete", comment }        whether the comment is still there
+//   { kind: "delete", comment, unreadUntil? }  whether the comment is still
+//                                      there; unreadUntil: its hold when the
+//                                      delete went (reads lag creates, A4)
 
 /**
  * What a poll's threads say about a change whose outcome wasn't known.
@@ -114,7 +116,10 @@ export function answerChecks(checks, poll, held, startedAt) {
     const there = c.kind === "resolve"
       ? threads.some((t) => t.id === c.thread)
       : threads.some((t) => t.comments.some((x) => x.id === c.comment));
-    return there || (!poll.more && !(c.kind === "resolve" && held.has(c.thread)));
+    if (there || poll.more) return there;
+    // Absent says nothing of what was just sent and not read back yet: a
+    // thread still held, or a comment that was when its delete went.
+    return c.kind === "resolve" ? !held.has(c.thread) : !(c.unreadUntil > startedAt);
   };
   const due = checks.filter((c) => startedAt >= c.after && known(c));
   const left = checks.filter((c) => !due.includes(c));

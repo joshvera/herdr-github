@@ -409,7 +409,9 @@ func (c *ghClient) loadFilesOnce(ctx context.Context, r repoRef, number int, wit
 					out.Review = known(rv)
 				}
 			}
-			if pr.Submitted != nil {
+			// The latest submitted is known only from a whole answer: in a
+			// partial one, a null node may be later than any found.
+			if pr.Submitted != nil && err == nil {
 				out.Submitted = known(submittedOf(pr.Submitted.Nodes))
 			}
 		} else if pr.HeadRefOid != out.Head {

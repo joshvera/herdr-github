@@ -594,11 +594,23 @@ func TestThreadsLeaveOutReviewsAPartialAnswerDidntGive(t *testing.T) {
 	}
 	pr.reviewsRaw = nil
 
-	// Answered, even with errors elsewhere: there, and null when there's none.
+	// The pending review found, even with errors elsewhere: there's only
+	// one, so it's known. Not so the latest submitted review: a node that
+	// came back null may be a later one, so what was found isn't the
+	// latest, and an A6 check would read the true latest's first sighting
+	// as "submitted".
+	pr.submitted = []map[string]any{submittedNode("PRR_older", "COMMENTED", true, "2026-11-19T10:00:00Z")}
 	got = opRun(t, `{"op":"threads",`+opPR+`}`)
 	if rv, ok := got["review"].(map[string]any); !ok || rv["id"] != "PRR_mine" {
 		t.Fatalf("review %v", got["review"])
 	}
+	if v, ok := got["submitted"]; ok {
+		t.Fatalf("submitted is %v, but a partial answer can't say which is the latest", v)
+	}
+
+	// No errors: there, and null when there's none.
+	pr.errors, pr.submitted = nil, nil
+	got = opRun(t, `{"op":"threads",`+opPR+`}`)
 	if v, ok := got["submitted"]; !ok || v != nil {
 		t.Fatalf("submitted %v (present %v)", v, ok)
 	}
