@@ -154,6 +154,26 @@ func TestMutateUnknowns(t *testing.T) {
 	}
 }
 
+// A mutation whose payload isn't read (merge, setDraft, deleteRef...) is
+// still unknown when GitHub answers without it: no errors isn't a yes.
+func TestMutateNoResultIsUnknownWhenThePayloadIsntRead(t *testing.T) {
+	for name, body := range map[string]string{
+		"null":    `{"data":{"resolveReviewThread":null}}`,
+		"missing": `{"data":{}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			n := mutationFake(t, writeJSON(body, 200))
+			err := newClient("github.com").mutate(ctxBG(), testMutation, map[string]any{"id": "T"}, "resolveReviewThread", nil)
+			if !isUnknown(err) {
+				t.Fatalf("want unknown, got %v", err)
+			}
+			if atomic.LoadInt32(n) != 1 {
+				t.Fatalf("%d requests: nothing is sent again", atomic.LoadInt32(n))
+			}
+		})
+	}
+}
+
 // The deadline falls while GitHub has the request: unknown.
 func TestMutateDeadlineAfterWriteIsUnknown(t *testing.T) {
 	old := minTimeToSend

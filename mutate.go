@@ -182,11 +182,13 @@ func (c *ghClient) mutate(ctx context.Context, query string, vars map[string]any
 		// wasn't done: it may have been.
 		return &actError{err: errors.New(msg), unknown: true}
 	}
-	if out == nil {
-		return nil
-	}
+	// No errors isn't a yes: without the payload it isn't known, whether or
+	// not the caller reads it.
 	if !applied {
 		return unknownErr("GitHub answered without the result. It may have gone through.")
+	}
+	if out == nil {
+		return nil
 	}
 	if err := json.Unmarshal(payload, out); err != nil {
 		return unknownErr("GitHub's answer didn't make sense (%s). It may have gone through.", clean(err.Error(), false))

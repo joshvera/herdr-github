@@ -45,7 +45,7 @@ func (o *opsGraphQL) handler() http.HandlerFunc {
 		switch {
 		case strings.HasPrefix(strings.TrimSpace(req.Query), "mutation"):
 			o.mutations = append(o.mutations, req)
-			reply(w, map[string]any{"ok": map[string]any{"clientMutationId": nil}})
+			replyDone(o.t, w, req)
 		case strings.Contains(req.Query, "pullRequest(number: $n) { id headRefOid }"):
 			i := o.headReads
 			if i >= len(o.heads) {
