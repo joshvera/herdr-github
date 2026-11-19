@@ -119,7 +119,8 @@ export class SubmitDialog {
    * dialog is open: the count follows it, and says so when it changes.
    * Either left out (undefined) means the poll didn't say: kept as it was.
    * Any change during the discard step cancels it: the step said what it
-   * would discard, so the word is typed again for what's there now.
+   * would discard, so the word is typed again for what's there now. So
+   * does one while "Send again?" is asked: it asked for what was there.
    * @param {Review | undefined} review
    * @param {Submitted | undefined} submitted
    * @param {number} now
@@ -136,6 +137,7 @@ export class SubmitDialog {
     this.reviewId = id;
     this.count = n;
     if (this.phase === "discard") this.cancelDiscard();
+    if (this.phase === "again") this.keep();
     if (this.pick === "discard" && !id) this.pick = "comment";
   }
 

@@ -221,3 +221,19 @@ test("a poll that didn't say what the review is (left out) changes nothing, and 
   assert.equal(d.poll({ review: undefined, submitted: undefined }, T0 + 3000), "waiting", "not known isn't gone");
   assert.equal(d.phase, "checking");
 });
+
+test("a poll that changes the review while 'Send again?' is asked drops back to the choices: never a send for something else", () => {
+  const d = open(review(7));
+  startDiscard(d);
+  for (const k of "discard") d.key(k, false, "", T0);
+  d.key("enter", false, "", T0);
+  d.outcome("unknown", null, "x", T0 + 1000);
+  d.tick(T0 + 1000 + CHECK_MS);
+  d.press(T0 + 70000, false, "lgtm");
+  assert.equal(d.phase, "again");
+  d.follow(null, null, T0 + 70500); // what a discard that went through looks like
+  assert.equal(d.phase, "choose");
+  assert.equal(d.note, DIALOG_NOTES.unconfirmed);
+  assert.notEqual(d.key("cmd-enter", false, "lgtm", T0 + 71000).do, "send", "not a comment review nobody picked");
+  assert.equal(d.phase, "again", "asks again, for what's picked now");
+});
