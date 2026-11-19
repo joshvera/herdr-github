@@ -1,9 +1,11 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -320,5 +322,46 @@ func TestAppDemoSubmittedReview(t *testing.T) {
 	}
 	if got := threads(demoPR480); got.Submitted.Val == nil || got.Submitted.Val.ID != first {
 		t.Fatalf("#480's submitted changed: %+v", got.Submitted)
+	}
+}
+
+// Each demo request is its own process, and the mod's polls and changes
+// overlap: a poll (which saves the review's growth) never loses a change
+// saved meanwhile, nor a change the growth. Run as goroutines, which take
+// the lock file as processes do (each opens its own).
+func TestAppDemoConcurrentRequestsLoseNothing(t *testing.T) {
+	t.Setenv("HERDR_PLUGIN_STATE_DIR", t.TempDir())
+	files := demoFilesReq(t)
+	run := func(raw string) {
+		var req appRequest
+		if err := json.Unmarshal([]byte(raw), &req); err != nil {
+			t.Error(err)
+			return
+		}
+		if _, err := appAnswer(context.Background(), withDefaults(config{}), req); err != nil {
+			t.Error(err)
+		}
+	}
+	var wg sync.WaitGroup
+	for _, f := range files.Files {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			run(`{"op":"act","do":"viewed","demo":true,` + demoPR482 + `,"head":"` + files.Head + `","path":"` + f.Path + `"}`)
+		}()
+		go func() {
+			defer wg.Done()
+			run(`{"op":"threads","demo":true,` + demoPR482 + `}`)
+		}()
+	}
+	wg.Wait()
+	after := demoFilesReq(t)
+	for _, f := range after.Files {
+		if f.Viewed != "viewed" {
+			t.Errorf("%s: %s, its mark lost", f.Path, f.Viewed)
+		}
+	}
+	if after.Review.Val == nil || after.Review.Val.Comments != 1+len(demoDrafts) {
+		t.Fatalf("review %+v: growth lost", after.Review.Val)
 	}
 }

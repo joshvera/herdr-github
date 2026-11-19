@@ -308,6 +308,11 @@ func appAnswer(ctx context.Context, cfg config, req appRequest) (any, error) {
 	var demo *appDemo
 	var src source
 	if req.Demo {
+		unlock, err := lockAppDemo()
+		if err != nil {
+			return nil, err
+		}
+		defer unlock()
 		demo = loadAppDemo()
 		src = demo.src
 	} else {
@@ -761,6 +766,29 @@ type demoChange struct {
 
 func appDemoPath() string { return filepath.Join(stateDir(), "app-demo.json") }
 
+// lockAppDemo takes the demo's lock file for one request, from its load to
+// its save: each request is its own process, and the mod's polls overlap its
+// changes, so a poll saving the review's growth over a mark saved meanwhile
+// (or the other way round) would lose it. The demo asks nothing of the
+// network, so the wait is short.
+func lockAppDemo() (unlock func(), err error) {
+	if err := os.MkdirAll(stateDir(), 0o700); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(filepath.Join(stateDir(), "app-demo.lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	return func() {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		_ = f.Close()
+	}, nil
+}
+
 func loadAppDemo() *appDemo {
 	d := &appDemo{src: newDemoSource()}
 	var saved map[string]demoChange
@@ -812,7 +840,20 @@ func (d *appDemo) save() error {
 	if err := os.MkdirAll(stateDir(), 0o700); err != nil {
 		return err
 	}
-	return os.WriteFile(appDemoPath(), data, 0o600)
+	// Whole or not at all: written beside it, then renamed over it.
+	tmp, err := os.CreateTemp(stateDir(), "app-demo-*.json")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name()) // gone once renamed; else the leftover
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), appDemoPath())
 }
 
 // ── jobs ──────────────────────────────────────────────────────────────────────
