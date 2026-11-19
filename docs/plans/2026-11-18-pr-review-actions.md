@@ -104,6 +104,8 @@ one known before the send, with `at` no earlier than the send's start less
 
 In a partial answer (`more: true`) whose review reads came back null, the
 `review` key, the `submitted` key or both are left out: GitHub didn't say.
+`review` is also left out when a partial answer shows no pending review (a
+null node may have been it).
 The mod then keeps what it last had for that key, and a check after an
 unknown submit or discard keeps waiting. Only an explicit `null` says there
 is none (a null for an unanswered read would say "your pending review is

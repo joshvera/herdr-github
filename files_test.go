@@ -34,6 +34,9 @@ type fakePR struct {
 	// Both review reads come back null (GitHub's errors say why), as in a
 	// partial answer.
 	reviewsNull bool
+	// When set, what the pending-reviews read says, as it is (a null node,
+	// say).
+	reviewsRaw any
 }
 
 func (p *fakePR) handler() http.HandlerFunc {
@@ -71,6 +74,9 @@ func (p *fakePR) handler() http.HandlerFunc {
 			pr["viewerDidAuthor"], pr["state"] = p.mine, "OPEN"
 			pr["reviews"] = map[string]any{"nodes": append([]map[string]any{}, p.reviews...)}
 			pr["submitted"] = map[string]any{"nodes": append([]map[string]any{}, p.submitted...)}
+			if p.reviewsRaw != nil {
+				pr["reviews"] = p.reviewsRaw
+			}
 			if p.reviewsNull {
 				pr["reviews"], pr["submitted"] = nil, nil
 			}
@@ -577,8 +583,18 @@ func TestThreadsLeaveOutReviewsAPartialAnswerDidntGive(t *testing.T) {
 		t.Fatalf("%v", got)
 	}
 
-	// Answered, even with errors elsewhere: there, and null when there's none.
+	// A null where a node or the nodes should be: GitHub failed under the
+	// review, which may be the pending one. Not known either.
 	pr.reviewsNull = false
+	for _, raw := range []any{map[string]any{"nodes": nil}, map[string]any{"nodes": []any{nil}}} {
+		pr.reviewsRaw = raw
+		if v, ok := opRun(t, `{"op":"threads",`+opPR+`}`)["review"]; ok {
+			t.Fatalf("%v: review is %v, but GitHub didn't say", raw, v)
+		}
+	}
+	pr.reviewsRaw = nil
+
+	// Answered, even with errors elsewhere: there, and null when there's none.
 	got = opRun(t, `{"op":"threads",`+opPR+`}`)
 	if rv, ok := got["review"].(map[string]any); !ok || rv["id"] != "PRR_mine" {
 		t.Fatalf("review %v", got["review"])

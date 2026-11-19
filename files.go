@@ -402,9 +402,12 @@ func (c *ghClient) loadFilesOnce(ctx context.Context, r repoRef, number int, wit
 			out.ID, out.Head = pr.ID, pr.HeadRefOid
 			out.PR = prInfo{ID: pr.ID, Mine: pr.ViewerDidAuthor, State: strings.ToLower(pr.State)}
 			// Null only in a partial answer (asked for, so a full answer
-			// has them): then not known, rather than none.
+			// has them): then not known, rather than none. Nor is "none
+			// found" in a partial answer: a null node may be the one.
 			if pr.Reviews != nil {
-				out.Review = known(pendingOf(pr.Reviews.Nodes))
+				if rv := pendingOf(pr.Reviews.Nodes); rv != nil || err == nil {
+					out.Review = known(rv)
+				}
 			}
 			if pr.Submitted != nil {
 				out.Submitted = known(submittedOf(pr.Submitted.Nodes))
