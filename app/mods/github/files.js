@@ -31,9 +31,9 @@ import { icon, tint, MONO } from "./look.js";
 import { treeRows, matchesPath, statusMark } from "./filetree.js";
 import { diffItems } from "./diffitems.js";
 import { TREE_ROW_H, treeRow, viewedMark, diffItem } from "./filesdraw.js";
-import { mergeThreads, countThreads, refind, shiftedAbove, PollHealth, HOLD_MS, reviewsOf } from "./follow.js";
-import { route, reviewAction, deletePrompt, latestMine, NEW_COMMITS, OLDER_COMMIT } from "./reviewkeys.js";
-import { withResolved, withComment, withReply, withEdit, withoutComment, withoutPending, checked, CHECK_MS } from "./sent.js";
+import { applyPoll, countThreads, refind, shiftedAbove, PollHealth, HOLD_MS, reviewsOf } from "./follow.js";
+import { route, reviewAction, deletePrompt, latestMine, mayMoveKeyboard, NEW_COMMITS, OLDER_COMMIT } from "./reviewkeys.js";
+import { withResolved, withComment, withReply, withEdit, withoutComment, withoutPending, answerChecks, viewedAfter, CHECK_MS } from "./sent.js";
 import { DraftStore, DRAFTS_KEY, DEMO_DRAFTS_KEY, SAVE_MS, draftId, makeDraft, rowOf, rowTarget, placeDrafts, unplaced, droppedNote } from "./drafts.js";
 import { SubmitDialog, CHOICES, DIALOG_NOTES } from "./dialog.js";
 import { Composer, CHECK_POLL_MS, NOTES, idsOn, request, purpose, typedSince } from "./compose.js";
@@ -83,7 +83,7 @@ export class FilesView {
     this.pr = app.cur;
     this.state = "idle"; // idle, loading, ok, error, old
     this.error = "";
-    this.data = null; // `files`'s answer: head, files, threads, more
+    this.data = null; // `files`'s answer: head, files, threads, more (the threads'), filesMore
     this.byPath = new Map(); // a file's threads
     this.reading = false; // the one `files` load out
     this.again = null; // asked for while one was out: { note }, once it answers
@@ -97,6 +97,7 @@ export class FilesView {
     this.pollAt = 0; // when the next poll is due
     this.health = new PollHealth();
     this.held = new Map(); // id → until: sent from here, not yet read back (follow.js)
+    this.edited = new Map(); // comment id → { body, until }: an edit saved from here, not yet read back
     this.topKey = null; // the first item the diff list drew: the scroll's anchor
     this.filesOwed = false; // a files answer was dropped: read again once nothing is sent
     this.sending = false; // a review change is out (send): nothing else goes until it answers
@@ -307,7 +308,18 @@ export class FilesView {
         this.failed.clear();
         this.asking = null; // an answer for the old head is let go
       }
-      this.data = { head: res.head, files: res.files ?? [], threads: res.threads ?? [], more: Boolean(res.more) };
+      // The same head again (r): what was just sent, not yet read back,
+      // stays, as a poll keeps it.
+      let threads = res.threads ?? [];
+      let files = res.files ?? [];
+      if (this.data?.head === res.head) {
+        ({ threads, held: this.held, edited: this.edited } = applyPoll({ threads: this.data.threads, held: this.held, edited: this.edited }, res, Date.now()));
+        files = countThreads(files, threads);
+      }
+      // `more` is the threads' (each poll says it again); filesMore is the
+      // files read's, which only r reads again.
+      const more = Boolean(res.more);
+      this.data = { head: res.head, files, threads, more, filesMore: more };
       this.indexThreads();
       ({ review: this.review, submitted: this.submitted } = reviewsOf(res, this));
       this.prInfo = res.pr ?? null;
@@ -468,9 +480,10 @@ export class FilesView {
       this.behind = true;
       return;
     }
-    const { threads, held } = mergeThreads(this.data.threads, res, this.held, Date.now());
-    this.held = held;
-    this.setThreads(threads, this.data.more || Boolean(res.more));
+    const m = applyPoll({ threads: this.data.threads, held: this.held, edited: this.edited }, res, Date.now());
+    this.held = m.held;
+    this.edited = m.edited;
+    this.setThreads(m.threads, m.more);
   }
 
   // Shows `threads` in place of the ones shown, moving nothing being read:
@@ -489,14 +502,13 @@ export class FilesView {
   }
 
   // A poll that started after a change with no known outcome ended says
-  // what happened to it (only for the head shown: a thread is by its id).
+  // what happened to it (only for the head shown: a thread is by its id),
+  // from the poll's own threads: what's held here isn't GitHub's word.
   answerChecks(res, startedAt, cx) {
-    if (res.head !== this.data.head) return;
-    const due = this.checks.filter((c) => startedAt >= c.after);
-    if (!due.length) return;
-    this.checks = this.checks.filter((c) => startedAt < c.after);
-    const last = checked(due[due.length - 1], this.data.threads);
-    this.say(last.text, cx, last.err);
+    if (res.head !== this.data.head || !this.checks.length) return;
+    const { said, left } = answerChecks(this.checks, res, this.held, startedAt);
+    this.checks = left;
+    if (said) this.say(said.text, cx, said.err);
   }
 
   // ── changing the review ────────────────────────────────────────────────
@@ -558,10 +570,14 @@ export class FilesView {
   }
 
   // y after shift-d: deletes the comment. Gone at once once GitHub says so.
+  // Its hold (just sent, not read back) goes as the delete does: a poll
+  // without it then means deleted, not "not read back yet". Only GitHub's
+  // no puts the hold back.
   deleteComment({ comment }, cx) {
+    const until = this.held.get(comment.id);
     const sent = this.send({ op: "act", do: "delete", comment: comment.id }, cx, (r, cx) => {
+      if (r.kind === "refused" && until !== undefined && this.alive()) this.held.set(comment.id, until);
       if (r.kind === "ok") {
-        this.held.delete(comment.id);
         if (this.alive() && this.data) this.setThreads(withoutComment(this.data.threads, comment.id));
         if (r.answer && "review" in r.answer) this.review = r.answer.review;
         // An edit of it, never sent, has nothing left to edit.
@@ -575,7 +591,10 @@ export class FilesView {
         this.say("No answer. Checking…", cx, true);
       }
     });
-    if (sent) this.say("Deleting…", cx);
+    if (!sent) return;
+    this.held.delete(comment.id);
+    this.edited.delete(comment.id);
+    this.say("Deleting…", cx);
   }
 
   // A key while a delete waits for y. A held y never gets here (route).
@@ -594,8 +613,9 @@ export class FilesView {
   // target's draft as it's typed. Sending is compose.js's state machine.
 
   // Opens it on `target`, with that target's draft, else `prefill`. One
-  // that was open closes, its draft kept.
-  openComposer(target, prefill, cx) {
+  // that was open closes, its draft kept. `keyboard`: it may take the
+  // keyboard (a key opened it); opened by a poll, only if mayMoveKeyboard.
+  openComposer(target, prefill, cx, keyboard = true) {
     const id = draftId(target);
     // Already open on it: the keyboard back into it, nothing reset.
     if (this.composer && this.composerId === id) return this.focusComposer(cx);
@@ -606,12 +626,15 @@ export class FilesView {
     // Set first: a change event for this set_value says nothing new.
     this.typed = draft?.body ?? prefill;
     this.ui.composer.set_value(this.typed);
-    if (this.composer.editable()) this.focusComposer(cx);
-    else {
+    if (this.composer.editable()) {
+      if (keyboard) this.focusComposer(cx);
+    } else {
       // Its last send may have gone: polls now, and every 5 s.
       this.pollAt = 0;
-      this.writing = false;
-      this.app.keys.focus();
+      if (keyboard) {
+        this.writing = false;
+        this.app.keys.focus();
+      }
     }
     cx.notify();
   }
@@ -626,7 +649,8 @@ export class FilesView {
     this.writing = true;
     this.ui.composer.focus();
     cx.timer.after(30, () => {
-      if (this.composer === c && c.editable() && this.alive()) this.ui.composer.focus();
+      // Not if the keyboard went elsewhere meanwhile (the filter, the dialog).
+      if (this.composer === c && c.editable() && this.alive() && this.writing && !this.filtering && !this.dialog) this.ui.composer.focus();
     });
     cx.notify();
   }
@@ -742,6 +766,9 @@ export class FilesView {
   // the draft is what's kept.
   draftSent(id, target, send, prior, r, cx) {
     const c = this.composerId === id && this.composer?.send?.since === send.since ? this.composer : null;
+    // Whether this answer may move the keyboard: not if it went to the
+    // filter meanwhile (rule 5).
+    const keyboard = mayMoveKeyboard(this.holder());
     this.draftsN++;
     if (r.answer && "review" in r.answer && this.alive()) this.review = r.answer.review;
     if (r.kind === "ok") {
@@ -749,7 +776,7 @@ export class FilesView {
       if (this.alive()) this.showSent(target, r.answer);
       if (c) {
         c.outcome("ok", "", Date.now());
-        this.closeComposer(cx);
+        this.closeComposer(cx, keyboard);
       }
       return this.say(target.kind === "edit" ? (target.published ? "Saved. Others see it at once." : "Saved.") : "Added to your pending review.", cx);
     }
@@ -759,7 +786,7 @@ export class FilesView {
       if (r.answer?.stale === true) this.behind = true;
       if (c) {
         c.outcome("refused", r.error, Date.now());
-        this.focusComposer(cx);
+        if (keyboard) this.focusComposer(cx);
       } else this.say(r.error, cx, true);
       return;
     }
@@ -781,6 +808,7 @@ export class FilesView {
     } else if (target.kind === "reply") threads = withReply(threads, target.thread, answer.comment);
     else threads = withEdit(threads, answer.comment);
     if (target.kind !== "edit") this.held.set(answer.comment.id, until);
+    else if (typeof answer.comment.body === "string") this.edited.set(answer.comment.id, { body: answer.comment.body, until });
     this.setThreads(threads);
   }
 
@@ -790,6 +818,7 @@ export class FilesView {
     const c = this.composer;
     if (!c) return;
     if (c.poll(res.threads ?? [], startedAt) !== "sent") return;
+    const keyboard = mayMoveKeyboard(this.holder());
     const id = this.composerId;
     const d = this.drafts.get(id);
     this.draftsN++;
@@ -798,11 +827,11 @@ export class FilesView {
     if (typedSince(d, c.send)) {
       this.drafts.saveNow({ ...d, send: null });
       this.composer = null;
-      this.openComposer(c.target, d.body, cx);
+      this.openComposer(c.target, d.body, cx, keyboard);
       return this.say("The text you sent earlier went through. What you typed since is kept here.", cx);
     }
     this.drafts.remove(id);
-    this.closeComposer(cx);
+    this.closeComposer(cx, keyboard);
     this.say("Sent: it's in your pending review.", cx);
   }
 
@@ -943,6 +972,7 @@ export class FilesView {
       this.review = null;
       if (kind === "discard" && this.data) {
         this.held.clear();
+        this.edited.clear();
         this.setThreads(withoutPending(this.data.threads));
       }
     }
@@ -1295,36 +1325,33 @@ export class FilesView {
   }
 
   // v: marks the open file viewed (or not) on GitHub, for the head shown;
-  // once it's viewed, on to the next that isn't. Drawn at once, put back if
-  // GitHub says no.
+  // once it's viewed, on to the next that isn't. Drawn at once, put back
+  // only if GitHub says no. Sent through send(), as every change is: never
+  // while another is out.
   toggleViewed(cx) {
     const f = this.file();
     if (!f) return;
-    if (this.saving.has(f.path)) return this.say(`Still saving ${f.path}…`, cx);
     const was = f.viewed;
     const to = was === "viewed" ? "unviewed" : "viewed";
     const head = this.data.head;
-    f.viewed = to;
-    this.saving.add(f.path);
-    cx.spawn(async (cx) => {
-      const r = await this.app.mutate({ op: "act", do: to, pr: this.prID(), path: f.path, head });
+    const sent = this.send({ op: "act", do: to, path: f.path, head }, cx, (r, cx) => {
       this.saving.delete(f.path);
       if (!this.alive()) return;
+      const mark = viewedAfter(r.kind, was, to);
+      if (f.viewed === to) f.viewed = mark;
       if (r.kind === "ok") {
         // The files read again meanwhile, for the same head: theirs too.
         const now = this.data?.head === head ? this.file(f.path) : null;
         if (now) now.viewed = to;
-      } else {
-        if (f.viewed === to) f.viewed = was;
-        if (r.kind === "unknown") this.say(`No answer about ${f.path}. r shows whether it was marked.`, cx, true);
-        else if (r.answer?.stale === true) {
-          this.behind = true;
-          this.say(`${NEW_COMMITS} ${f.path} wasn't marked.`, cx, true);
-        }
-        else this.say(r.error, cx, true);
-      }
-      cx.notify();
+      } else if (r.kind === "unknown") this.say(`No answer about ${f.path}. It may be marked or not: r shows which.`, cx, true);
+      else if (r.answer?.stale === true) {
+        this.behind = true;
+        this.say(`${NEW_COMMITS} ${f.path} wasn't marked.`, cx, true);
+      } else this.say(r.error, cx, true);
     });
+    if (!sent) return;
+    f.viewed = to;
+    this.saving.add(f.path);
     if (to === "viewed") this.nextUnviewed(cx);
     cx.notify();
   }
@@ -1540,7 +1567,9 @@ export class FilesView {
     const { rows } = this.tree();
     const files = this.data.files;
     const seen = files.filter((f) => f.viewed === "viewed").length;
-    const more = this.data.more;
+    // The files read can't say which of its caps it hit, so its word stands
+    // until r; a poll's says only the threads'.
+    const more = this.data.filesMore || this.data.more;
     const listH = H - FILTER_H - SUMMARY_H - 2 * GAP - (more ? NOTE_H * 2 + GAP : 0);
     return v_flex().w(TREE_W).flex_none().h(H).gap(GAP)
       .child(h_flex().id("files-filter").flex_none().h(FILTER_H).px(10).gap(8).items_center().rounded(8).border_1()

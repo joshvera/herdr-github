@@ -41,7 +41,15 @@ export function mergeThreads(prev, answer, held, now) {
     const waiting = (old?.comments ?? []).filter((c) => keep.has(c.id));
     return waiting.length ? { ...t, comments: [...t.comments, ...waiting] } : t;
   });
-  const kept = prev.filter((t) => !seen.has(t.id) && (answer.more || keep.has(t.id)));
+  const kept = prev.filter((t) => !seen.has(t.id)).flatMap((t) => {
+    if (answer.more) return [t];
+    if (!keep.has(t.id)) return [];
+    // A thread just sent: only its comments still held (one deleted since
+    // isn't drawn back), or nothing when none is.
+    const comments = t.comments.filter((c) => keep.has(c.id));
+    if (!comments.length) return [];
+    return comments.length === t.comments.length ? [t] : [{ ...t, comments }];
+  });
   return { threads: byPath([...threads, ...kept]), held: keep };
 }
 
@@ -154,4 +162,36 @@ export function reviewsOf(res, prev) {
     review: "review" in res ? res.review ?? null : prev.review,
     submitted: "submitted" in res ? res.submitted ?? null : prev.submitted,
   };
+}
+
+/**
+ * A `threads` answer (or a `files` one for the same head, after r) merged
+ * into what's shown: threads by mergeThreads, an edit just saved shown with
+ * its new text until a poll has it or HOLD_MS pass (as A4 holds a comment),
+ * and `more` as this answer says it (it isn't sticky: once every thread is
+ * there, it's false).
+ * @param {{ threads: any[], held: Map<string, number>, edited: Map<string, { body: string, until: number }>, more?: boolean }} shown
+ * @param {{ threads?: any[], more?: boolean }} answer
+ * @param {number} now
+ * @returns {{ threads: any[], held: Map<string, number>, edited: Map<string, { body: string, until: number }>, more: boolean }}
+ */
+export function applyPoll(shown, answer, now) {
+  const { threads, held } = mergeThreads(shown.threads, answer, shown.held, now);
+  const edited = new Map([...shown.edited].filter(([, e]) => e.until > now));
+  const shownEdits = threads.map((t) => {
+    if (!t.comments.some((c) => edited.has(c.id))) return t;
+    return {
+      ...t,
+      comments: t.comments.map((c) => {
+        const e = edited.get(c.id);
+        if (!e) return c;
+        if (c.body === e.body) {
+          edited.delete(c.id); // read back: GitHub's word from here
+          return c;
+        }
+        return { ...c, body: e.body };
+      }),
+    };
+  });
+  return { threads: shownEdits, held, edited, more: Boolean(answer.more) };
 }

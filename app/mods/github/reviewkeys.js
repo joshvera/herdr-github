@@ -138,3 +138,14 @@ export function deletePrompt(comment) {
     ? "Delete your pending comment? y deletes, any other key keeps it."
     : "Delete your published comment? Others will see it gone. y deletes, any other key keeps it.";
 }
+
+/**
+ * Whether an outcome that came by itself (a send's answer, a poll) may move
+ * the keyboard: only from the tab's own keys or the composer. Typing in the
+ * filter, the dialog, or a delete waiting for y keep it (rule 5); the
+ * outcome then changes only what's shown.
+ * @param {{ keyboard: string, dialog: boolean, confirm: boolean }} h holder(), when the outcome came
+ */
+export function mayMoveKeyboard(h) {
+  return !h.dialog && !h.confirm && (h.keyboard === "view" || h.keyboard === "composer");
+}

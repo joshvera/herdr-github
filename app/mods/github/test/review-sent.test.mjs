@@ -1,7 +1,7 @@
 // What a change sent from the Files tab does to the threads shown (sent.js).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { withResolved, withComment, withReply, withEdit, withoutComment, withoutPending, checked } from "../sent.js";
+import { withResolved, withComment, withReply, withEdit, withoutComment, withoutPending, checked, answerChecks, viewedAfter } from "../sent.js";
 
 const comment = (id, extra = {}) => ({ id, author: "sam", body: "hi", created: 1, state: "submitted", url: "", mine: false, canEdit: false, canDelete: false, ...extra });
 const thread = (id, comments, extra = {}) => ({
@@ -72,4 +72,22 @@ test("a check after an unknown outcome reads the truth from the poll", () => {
   assert.equal(checked({ kind: "resolve", thread: "T9", want: true }, resolved).err, true);
   assert.deepEqual(checked({ kind: "delete", comment: "C9" }, resolved), { text: "It went through: deleted.", err: false });
   assert.equal(checked({ kind: "delete", comment: "C1" }, resolved).err, true);
+});
+
+test("a check reads the poll's own threads, and waits when the poll can't say (more, or a thread still held)", () => {
+  const poll = { threads: [thread("T1", [comment("C1")])], more: false };
+  const del = { kind: "delete", comment: "C9", after: 100 };
+  assert.deepEqual(answerChecks([del], poll, new Map(), 200), { said: { text: "It went through: deleted.", err: false }, left: [] });
+  assert.deepEqual(answerChecks([del], poll, new Map(), 50), { said: null, left: [del] }, "a poll from before the send ended");
+  assert.deepEqual(answerChecks([del], { ...poll, more: true }, new Map(), 200), { said: null, left: [del] }, "not in a page of more: not known gone");
+  const res = { kind: "resolve", thread: "T9", want: true, after: 100 };
+  assert.deepEqual(answerChecks([res], poll, new Map([["T9", 999]]), 200), { said: null, left: [res] }, "just sent, not read back yet");
+  assert.deepEqual(answerChecks([res], poll, new Map(), 200).said, { text: "That thread is gone from the PR.", err: true });
+  assert.deepEqual(answerChecks([res], { ...poll, more: true }, new Map(), 200), { said: null, left: [res] });
+});
+
+test("an unknown viewed mark stays as asked; only a refusal puts it back", () => {
+  assert.equal(viewedAfter("ok", "unviewed", "viewed"), "viewed");
+  assert.equal(viewedAfter("refused", "unviewed", "viewed"), "unviewed");
+  assert.equal(viewedAfter("unknown", "unviewed", "viewed"), "viewed", "a guess either way; as asked, with the No answer line");
 });

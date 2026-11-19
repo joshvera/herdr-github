@@ -95,3 +95,39 @@ export function checked(check, threads) {
   const there = threads.some((t) => t.comments.some((c) => c.id === check.comment));
   return there ? { text: "It didn't go through: the comment is still there. shift-d tries again.", err: true } : { text: "It went through: deleted.", err: false };
 }
+
+/**
+ * What a poll says of the checks due: read from the poll's own threads
+ * (GitHub's word, not what's held here). One whose thread or comment the
+ * poll lacks while the poll has `more`, or whose thread is still held (sent,
+ * not read back yet), can't be told: it waits for a later poll, and is let
+ * go after CHECK_MS like any other.
+ * @param {any[]} checks
+ * @param {{ threads?: any[], more?: boolean }} poll
+ * @param {Map<string, number>} held
+ * @param {number} startedAt when the poll began
+ * @returns {{ said: { text: string, err: boolean } | null, left: any[] }}
+ */
+export function answerChecks(checks, poll, held, startedAt) {
+  const threads = poll.threads ?? [];
+  const known = (c) => {
+    const there = c.kind === "resolve"
+      ? threads.some((t) => t.id === c.thread)
+      : threads.some((t) => t.comments.some((x) => x.id === c.comment));
+    return there || (!poll.more && !(c.kind === "resolve" && held.has(c.thread)));
+  };
+  const due = checks.filter((c) => startedAt >= c.after && known(c));
+  const left = checks.filter((c) => !due.includes(c));
+  return { said: due.length ? checked(due[due.length - 1], threads) : null, left };
+}
+
+/**
+ * A file's viewed mark once its `viewed` or `unviewed` send ended.
+ * @param {"ok" | "refused" | "unknown"} kind
+ * @param {string} was
+ * @param {string} to
+ */
+export function viewedAfter(kind, was, to) {
+  // Unknown: it may be marked or not. Left as asked, and the line says so.
+  return kind === "refused" ? was : to;
+}

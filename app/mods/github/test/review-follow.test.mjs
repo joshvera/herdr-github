@@ -1,7 +1,7 @@
 // Following the PR: merging a poll without moving the reader (follow.js).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mergeThreads, countThreads, refind, shiftedAbove, reviewChip, PollHealth, HOLD_MS, reviewsOf } from "../follow.js";
+import { mergeThreads, countThreads, refind, shiftedAbove, reviewChip, PollHealth, HOLD_MS, reviewsOf, applyPoll } from "../follow.js";
 import { diffItems } from "../diffitems.js";
 
 const NOW = 1_800_000_000_000;
@@ -105,4 +105,44 @@ test("an answer that leaves the review out (GitHub didn't say) keeps what was kn
   const next = { review: { id: "PRR_1", comments: 8 }, submitted: { id: "PRR_2", at: 2 } };
   assert.deepEqual(reviewsOf(next, prev), next);
   assert.deepEqual(reviewsOf({ review: null }, prev), { review: null, submitted: prev.submitted }, "an older binary with no submitted");
+});
+
+const shownWith = (threads, held = new Map(), extra = {}) => ({ threads, held, edited: new Map(), more: false, ...extra });
+
+test("a comment deleted while held isn't drawn back from its thread's hold", () => {
+  const sent = thread("T9", 3, [comment("C9")]);
+  const held = new Map([["T9", NOW + HOLD_MS], ["C9", NOW + HOLD_MS]]);
+  held.delete("C9"); // what shift-d y does as it sends
+  assert.deepEqual(applyPoll(shownWith([sent], held), { threads: [], more: false }, NOW + 1000).threads, [], "the thread had nothing else");
+  const two = thread("T9", 3, [comment("C9"), comment("C10")]);
+  const held2 = new Map([["T9", NOW + HOLD_MS], ["C10", NOW + HOLD_MS]]);
+  const out = applyPoll(shownWith([two], held2), { threads: [], more: false }, NOW + 1000).threads;
+  assert.deepEqual(out.map((t) => t.comments.map((c) => c.id)), [["C10"]], "the reply just sent stays");
+});
+
+test("a poll's more replaces the last one: once the threads are all there, it's false", () => {
+  const prev = [thread("T1", 2, [comment("C1")])];
+  assert.equal(applyPoll(shownWith(prev, new Map(), { more: true }), { threads: prev, more: false }, NOW).more, false);
+  assert.equal(applyPoll(shownWith(prev), { threads: prev, more: true }, NOW).more, true);
+});
+
+test("an edit just saved shows its new text until a poll has it, or for 60 seconds", () => {
+  const before = [thread("T1", 2, [comment("C1", "old")])];
+  const shown = shownWith([thread("T1", 2, [comment("C1", "new")])]);
+  shown.edited = new Map([["C1", { body: "new", until: NOW + HOLD_MS }]]);
+  const lagging = applyPoll(shown, { threads: before, more: false }, NOW + 1000);
+  assert.equal(lagging.threads[0].comments[0].body, "new", "the poll from before the edit doesn't take it back");
+  assert.equal(lagging.edited.size, 1);
+  const caught = applyPoll({ ...shown, ...lagging }, { threads: [thread("T1", 2, [comment("C1", "new")])], more: false }, NOW + 2000);
+  assert.equal(caught.edited.size, 0, "let go once a poll has it");
+  const expired = applyPoll(shown, { threads: before, more: false }, NOW + HOLD_MS + 1);
+  assert.equal(expired.threads[0].comments[0].body, "old", "GitHub's word after 60 s");
+  assert.equal(expired.edited.size, 0);
+});
+
+test("a reload of the same head keeps what was just sent and not yet read back", () => {
+  const sent = thread("T9", 3, [comment("C9")]);
+  const held = new Map([["T9", NOW + HOLD_MS], ["C9", NOW + HOLD_MS]]);
+  const files = { threads: [thread("T1", 2, [comment("C1")])], more: false };
+  assert.deepEqual(applyPoll(shownWith([sent], held), files, NOW + 1000).threads.map((t) => t.id), ["T1", "T9"]);
 });

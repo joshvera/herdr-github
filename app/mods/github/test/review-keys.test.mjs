@@ -1,7 +1,7 @@
 // What a key does on the Files tab once review actions are in (reviewkeys.js).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { route, reviewAction, latestMine, deletePrompt, OLD_BINARY, NEW_COMMITS, OLDER_COMMIT } from "../reviewkeys.js";
+import { route, reviewAction, latestMine, deletePrompt, mayMoveKeyboard, OLD_BINARY, NEW_COMMITS, OLDER_COMMIT } from "../reviewkeys.js";
 
 const view = { keyboard: "view" };
 const comment = (id, extra = {}) => ({ id, author: "sam", body: "hi", state: "submitted", mine: false, canEdit: false, canDelete: false, ...extra });
@@ -131,4 +131,14 @@ test("shift-s opens the submit dialog from anywhere on the tab, once the files a
   assert.deepEqual(reviewAction("shift-s", { state: "ok", follows: true, item: null }), { act: "submit" });
   assert.equal(reviewAction("shift-s", { state: "ok", follows: false, item: null }).say, OLD_BINARY);
   assert.match(reviewAction("shift-s", { state: "loading", follows: false, item: null }).say, /Still loading/);
+});
+
+test("an outcome that comes by itself moves the keyboard only from the view or the composer (rule 5)", () => {
+  const h = (keyboard, extra = {}) => ({ keyboard, dialog: false, composer: true, confirm: false, again: false, ...extra });
+  assert.equal(mayMoveKeyboard(h("view")), true);
+  assert.equal(mayMoveKeyboard(h("composer")), true);
+  assert.equal(mayMoveKeyboard(h("filter")), false, "typing in the filter meanwhile: the next key would land elsewhere");
+  assert.equal(mayMoveKeyboard(h("body", { dialog: true })), false, "the dialog's body box");
+  assert.equal(mayMoveKeyboard(h("view", { dialog: true })), false, "the dialog's choices");
+  assert.equal(mayMoveKeyboard(h("view", { confirm: true })), false, "a delete waiting for y");
 });
