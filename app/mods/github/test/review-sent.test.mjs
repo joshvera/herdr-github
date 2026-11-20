@@ -1,7 +1,7 @@
 // What a change sent from the Files tab does to the threads shown (sent.js).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { withResolved, withComment, withReply, withEdit, withoutComment, withoutPending, checked, answerChecks, viewedAfter, leaveNote, noteLines } from "../sent.js";
+import { withResolved, withComment, withReply, withEdit, withoutComment, withoutPending, checked, answerChecks, viewedAfter, leaveNote, noteLines, whoChangedSays } from "../sent.js";
 
 const comment = (id, extra = {}) => ({ id, author: "sam", body: "hi", created: 1, state: "submitted", url: "", mine: false, canEdit: false, canDelete: false, ...extra });
 const thread = (id, comments, extra = {}) => ({
@@ -130,6 +130,23 @@ test("signed out, not someone else: said as a sign-out, what was out still not k
   assert.doesNotMatch(out, /someone else/);
   assert.match(leaveNote({ ...quiet, dialog: { phase: "choose", kind: "" } }), /^Signed out of GitHub now, so the Files tab started over/);
   assert.equal(leaveNote(quiet), "");
+});
+
+test("who changing under the PR screen always says why; a sign-out says status's words and reads nothing", () => {
+  const statusErr = "Not signed in to GitHub on any machine: gh isn't signed in. Run gh auth login on one.";
+  // Signed out, opened straight: a read now would fail at once ("not
+  // connected") and say over the sign-out.
+  assert.deepEqual(whoChangedSays({ signedOut: true, direct: true, held: false, statusErr }), { reread: false, err: statusErr, flash: "" });
+  // Signed out, from the list: whatever the failed read said before, the
+  // list says the sign-out.
+  assert.equal(whoChangedSays({ signedOut: true, direct: false, held: true, statusErr }).err, statusErr);
+  // Someone else, nothing out: told the screen changed.
+  assert.match(whoChangedSays({ signedOut: false, direct: false, held: false, statusErr: "" }).flash, /lists started over/);
+  const direct = whoChangedSays({ signedOut: false, direct: true, held: false, statusErr: "" });
+  assert.equal(direct.reread, true);
+  assert.match(direct.flash, /read again as them/);
+  // A held note already says it.
+  assert.deepEqual(whoChangedSays({ signedOut: false, direct: true, held: true, statusErr: "" }), { reread: true, err: "", flash: "" });
 });
 
 test("a held note stays first; what's said after shows under it, never in its place", () => {

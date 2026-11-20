@@ -45,8 +45,15 @@ test("F1b: a who change on the PR screen says what was out before dropping it, h
   const toList = s.indexOf("this.toList(cx)");
   assert.ok(leave >= 0 && toList > leave, "leave() before the list");
   assert.ok(s.indexOf("this.hold(note, cx)") > toList, "held after toList, which clears what's said");
-  // Nothing out: still told why the screen changed (the 60 s re-ask may do it).
-  assert.ok(s.lastIndexOf("this.say(") > toList);
+  // Nothing out: still told why the screen changed (sent.js whoChangedSays;
+  // the 60 s re-ask may be what changed it).
+  assert.match(s, /whoChangedSays\(\{ signedOut: this\.signedOut, direct: this\.direct, held: Boolean\(note\), statusErr: this\.statusErr \}\)/);
+  assert.ok(s.indexOf("this.say(says.err, cx, true)") > toList && s.indexOf("this.say(says.flash, cx)") > toList);
+  assert.match(s, /if \(says\.reread\) this\.loadDetail\(cx, "auto"\)/);
+});
+
+test("F1b: a change from the Overview with no answer is held, so the failing reads after it can't say over it", () => {
+  assert.match(body(main, "act"), /this\.hold\("No answer\. Check the PR before trying again\.", cx\)/);
 });
 
 test("F1b: what's held goes only when the user leaves the screen it's on, never when toList or say run", () => {
@@ -55,7 +62,6 @@ test("F1b: what's held goes only when the user leaves the screen it's on, never 
 });
 
 test("F3: a who change's reads on the PR screen are automatic; opening it and r may look", () => {
-  assert.match(body(main, "settle"), /this\.loadDetail\(cx, "auto"\)/);
   const act = body(main, "act");
   assert.match(act, /this\.loadDetail\(cx, "auto"\)/);
   assert.match(act, /this\.loadAll\(cx, "auto"\)/);
@@ -67,9 +73,11 @@ test("F3: a who change's reads on the PR screen are automatic; opening it and r 
   assert.match(body(main, "load"), /!this\.mayLook\(why\)\) throw e;\n\s*await this\.findGitHub\(\)/);
 });
 
-test("F4: a sign-out found by status forgets once, as a sign-out", () => {
+test("F4: a sign-out found by status forgets once, as a sign-out, and who stays for confirmWho's wipe", () => {
   const s = body(main, "statusFailed");
-  assert.match(s, /this\.who = null;\n\s*this\.forget\(true\);/);
+  assert.match(s, /e\?\.cachedSignedOut && !this\.forgotSignOut\) \{\n\s*this\.forgotSignOut = true;\n\s*this\.forget\(true\);/);
+  assert.doesNotMatch(s, /this\.who = /);
+  assert.match(body(main, "confirmWho"), /this\.forgotSignOut = false;/);
   assert.match(body(main, "forget"), /this\.signedOut = signedOut;/);
 });
 

@@ -172,6 +172,25 @@ export function leaveNote({ sending, composer, dialog, checks, signedOut = false
   return "";
 }
 
+// What main's settle says once who changed under the PR screen, past what
+// leaveNote held (`held`), and whether a PR opened straight is read again.
+// The user is always told why the screen changed:
+//
+//   signed out ──► status's own words; nothing read (no one to read it as:
+//                  it would fail at once and say "not connected" instead)
+//   someone else ► read again; said so, unless a held note already says it
+
+/**
+ * @param {{ signedOut: boolean, direct: boolean, held: boolean, statusErr: string }} s
+ * @returns {{ reread: boolean, err: string, flash: string }}
+ */
+export function whoChangedSays({ signedOut, direct, held, statusErr }) {
+  if (signedOut) return { reread: false, err: statusErr, flash: "" };
+  if (held) return { reread: direct, err: "", flash: "" };
+  const flash = direct ? "Signed in as someone else now: the PR is read again as them." : "Signed in as someone else now, so the lists started over.";
+  return { reread: direct, err: "", flash };
+}
+
 // The popup's foot: what's held (main's hold: leaveNote's, until dismissed
 // or the user leaves the screen it's on) first, then what's said now, the
 // busy line before an error before a flash. Nothing said replaces a held

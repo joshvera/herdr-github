@@ -19,7 +19,7 @@ import { PR_TABS, tabFor, prRoute } from "./prkeys.js";
 import { FilesView } from "./files.js";
 import { sendOnce, MutationGate, MUTATION_TIMEOUT } from "./mutation.js";
 import { reviewChip } from "./follow.js";
-import { noteLines } from "./sent.js";
+import { noteLines, whoChangedSays } from "./sent.js";
 import { askSignedIn, mayLook } from "./reads.js";
 import { Store } from "./store.js";
 import { whoOf, sameWho, mergeWho, empty, seed, listPatch, resolveRepo, pickedRepo, staleMark, stamper, takesOver, canAct } from "./cache.js";
@@ -266,6 +266,7 @@ export default class GitHub extends View {
     this.who = null;
     this.gen = 0;
     this.signedOut = false; // why gen last moved (forget): a sign-out, not someone else
+    this.forgotSignOut = false; // this sign-out is forgotten already (statusFailed)
     this.confirmed = new Promise((resolve) => (this.confirm = resolve));
     this.width = 900;
     this.from = p.back ?? null; // the mod it was opened from, to go back to
@@ -438,6 +439,11 @@ export default class GitHub extends View {
     const was = this.cachedWho();
     const same = was && sameWho(was, who);
     this.who = same ? mergeWho(was, who) : who;
+    // Someone is signed in: status's error is over, and a later sign-out is
+    // a new one (statusFailed).
+    if (this.err === this.statusErr) this.err = "";
+    this.statusErr = "";
+    this.forgotSignOut = false;
     if (was && !same) {
       this.forget();
       this.store.write("lists", { who });
@@ -468,13 +474,13 @@ export default class GitHub extends View {
   // (mutate refuses it too). What it had out is said not known before it
   // goes, and held (hold) on the screen the user lands on: nothing said
   // later replaces it. With nothing out, the user is still told why the
-  // screen changed under them.
+  // screen changed under them (sent.js whoChangedSays).
   settle(cx) {
     if (this.settledGen === this.gen) return;
     this.settledGen = this.gen;
     if (this.screen === "pr" && this.cur) {
-      const was = this.err;
       const note = this.files?.leave(this.signedOut) ?? "";
+      const says = whoChangedSays({ signedOut: this.signedOut, direct: this.direct, held: Boolean(note), statusErr: this.statusErr });
       if (!this.direct) {
         this.files = null;
         this.toList(cx);
@@ -487,15 +493,13 @@ export default class GitHub extends View {
         this.detailInfo = null;
         this.menu = this.parked = null;
         // Owed because who changed, not asked for: it never looks again.
-        this.loadDetail(cx, "auto");
+        if (says.reread) this.loadDetail(cx, "auto");
         this.keys.focus();
       }
       if (note) this.hold(note, cx);
-      // toList cleared it: status's "Not signed in" still stands.
-      if (was && was === this.statusErr) this.err = was;
-      else if (!note && !this.signedOut) {
-        this.say(this.direct ? "Signed in as someone else now: the PR is read again as them." : "Signed in as someone else now, so the lists started over.", cx);
-      }
+      // After toList, which clears what's said.
+      if (says.err) this.say(says.err, cx, true);
+      else if (says.flash) this.say(says.flash, cx);
     }
     this.loadMissing(cx);
     cx.notify();
@@ -511,10 +515,11 @@ export default class GitHub extends View {
     const said = e instanceof DevError ? e.message : `Not signed in to GitHub on any machine: ${e?.message ?? e}. Run gh auth login on one.`;
     if (!this.err || this.err === this.statusErr) this.err = said;
     this.statusErr = said;
-    if (!(e instanceof DevError) && e?.cachedSignedOut) {
-      // Nobody is who was: forgotten once, said as a sign-out (settle), and
-      // with who gone the next re-ask can't find the same sign-out again.
-      this.who = null;
+    // Forgotten once per sign-out, said as one (settle): the 60 s re-ask
+    // finds the same sign-out each time until status finds someone, and
+    // who stays, so confirmWho still wipes the files if that's someone else.
+    if (!(e instanceof DevError) && e?.cachedSignedOut && !this.forgotSignOut) {
+      this.forgotSignOut = true;
       this.forget(true);
     }
   }
@@ -1127,7 +1132,9 @@ export default class GitHub extends View {
       const ok = r.kind === "ok";
       if (ok) this.say(r.answer.note ?? "Done", cx);
       else if (r.kind === "refused") this.say(r.error, cx, true);
-      else this.say("No answer. Check the PR before trying again.", cx, true);
+      // Not known whether it went: held, so the reads below, failing, can't
+      // say over it.
+      else this.hold("No answer. Check the PR before trying again.", cx);
       this.acting.delete(pr.key);
       this.busy = "";
       // What follows (a merge's cleanup) is about this PR: only while it's
