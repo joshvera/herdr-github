@@ -138,7 +138,8 @@ export function hunkTail(hunk) {
 // The list's items for one file: `rows` (the diff's, or [] when it has
 // none), `threads` (the file's), `folded(t)`, and the list's width.
 // Every item has a unique `key`, its height `h`, and `t` when it's part of
-// a thread.
+// a thread; a thread's items also have `under`, the kind of the diff row it
+// hangs from ("add", "del", "ctx"), or none when it isn't on a row.
 export function diffItems({ rows, threads, folded, width }) {
   const textW = Math.max(160, width - THREAD_INSET);
   const items = [];
@@ -149,27 +150,27 @@ export function diffItems({ rows, threads, folded, width }) {
     keys.add(key);
     items.push({ ...it, key });
   };
-  const thread = (t, loose) => {
+  const thread = (t, loose, under) => {
     const fold = folded(t);
     const hunk = loose && t.hunk ? hunkTail(t.hunk) : [];
-    push({ kind: "thread", key: `t:${t.id}`, h: THREAD_H, t, folded: fold, last: fold || (!hunk.length && !t.comments.length) });
+    push({ kind: "thread", key: `t:${t.id}`, h: THREAD_H, t, under, folded: fold, last: fold || (!hunk.length && !t.comments.length) });
     if (fold) return;
-    if (hunk.length) push({ kind: "hunk", key: `h:${t.id}`, h: hunk.length * HUNK_LINE_H + 10 + (t.comments.length ? 0 : 6), t, lines: hunk, last: !t.comments.length });
+    if (hunk.length) push({ kind: "hunk", key: `h:${t.id}`, h: hunk.length * HUNK_LINE_H + 10 + (t.comments.length ? 0 : 6), t, under, lines: hunk, last: !t.comments.length });
     t.comments.forEach((c, ci) => {
       const ps = pieces(c.body ?? "", textW);
       ps.forEach((p, pi) => {
         const first = pi === 0;
         const last = ci === t.comments.length - 1 && pi === ps.length - 1;
         const h = Math.ceil((first ? AUTHOR_H : 0) + p.h * 1.15 + PAD + (last ? 6 : 0));
-        push({ kind: "comment", key: `c:${c.id}:${pi}`, h, t, c, text: p.text, first, last });
+        push({ kind: "comment", key: `c:${c.id}:${pi}`, h, t, under, c, text: p.text, first, last });
       });
     });
   };
   const { after, loose } = placeThreads(rows, threads);
-  for (const t of loose) thread(t, true);
+  for (const t of loose) thread(t, true, undefined);
   rows.forEach((row, i) => {
     push({ kind: "row", key: `r${i}`, h: ROW_H, row });
-    for (const t of after.get(i) ?? []) thread(t, false);
+    for (const t of after.get(i) ?? []) thread(t, false, row.kind);
   });
   return items;
 }

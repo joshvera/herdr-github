@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.11.0-joshvera.2 - 2026-11-20
+
+- **The popup opens on what it last knew**: all three lists show their
+  cached rows on the first frame and a PR you've opened before shows its
+  Overview at once, each marked "Refreshing…" until the fresh answer lands.
+  Nothing that changes a PR (merge, draft, cleanup) runs from a cached
+  Overview. The cache is emptied when the signed-in account changes.
+- **Review from the Files changed tab**: comment on a line (`c`), reply,
+  edit (`e`), delete (`shift-d`), resolve and unresolve (`x`), and submit or
+  discard your pending review (`shift-s`). Everything you write is pending
+  until you submit. Drafts survive closing the popup.
+- **The Files changed tab follows the PR**: it reads the review threads
+  every 15 seconds, so a review being written elsewhere (by an agent, or on
+  github.com) shows up without a key press, and the cursor and scroll stay
+  put. New commits are announced, never loaded under you (`r` reloads).
+- **A change is sent to GitHub once**: when no answer comes back, the tab
+  checks what GitHub has instead of sending again, and says so when it
+  can't tell. A change made under one account is never sent as another.
+- New requests: `threads`, and `act` with `comment`, `reply`, `resolve`,
+  `unresolve`, `edit`, `delete`, `submit` and `discard`.
+
 ## 0.11.0-joshvera.1 - 2026-11-18
 
 The first release of the joshvera/herdr-github fork, a string upstream can

@@ -11,16 +11,22 @@
 
 import { View, div } from "gpui-kit";
 import * as fs from "fs/promises";
-import { v_flex, h_flex, InputState, Input, TextView, Scrollbar, v_virtual_list, VirtualListScrollHandle, ScrollHandle } from "gpui-base";
-import { agents, panes, machines, spaces, run, exec, theme, appHome, props, closeOverlay, openOverlay, nextCommand, knownAgents } from "herdr";
+import { v_flex, h_flex, InputState, TextareaState, Input, TextView, Scrollbar, v_virtual_list, VirtualListScrollHandle, ScrollHandle } from "gpui-base";
+import { agents, panes, machines, spaces, run, exec, theme, appHome, props, closeOverlay, openOverlay, nextCommand, knownAgents, checking } from "herdr";
 import { demoAgents, DEMO_REPO } from "./demo.js";
 import { tones, tint, countPill, groupOf, toneColor, prLook, checkLook, ago, icon, chip, words, key, cap, MONO } from "./look.js";
 import { PR_TABS, tabFor, prRoute } from "./prkeys.js";
 import { FilesView } from "./files.js";
+import { sendOnce, MutationGate, MUTATION_TIMEOUT } from "./mutation.js";
+import { reviewChip } from "./follow.js";
+import { noteLines, whoChangedSays } from "./sent.js";
+import { askSignedIn, mayLook } from "./reads.js";
+import { Store } from "./store.js";
+import { whoOf, sameWho, mergeWho, empty, seed, listPatch, resolveRepo, pickedRepo, staleMark, stamper, takesOver, canAct } from "./cache.js";
 
 // The herdr-github this mod is part of (its release; the repo's tests hold it
 // to herdr-plugin.toml's version).
-export const GITHUB_VERSION = "0.11.0-joshvera.1";
+export const GITHUB_VERSION = "0.11.0-joshvera.2";
 
 // Puts that release on a machine, once: from this fork's releases, into a
 // folder of the fork's own version (joshvera-<version>), so it never touches
@@ -189,9 +195,6 @@ const SIDE_W = 280;
 // Checks, in the order they're counted and listed: what needs you first.
 const CHECK_ORDER = ["fail", "pending", "pass", "skip"];
 
-// Where the lists are kept between openings.
-const CACHE = `${appHome()}/github-cache.json`;
-
 const machineOf = (address) => (address?.includes("/") ? address.split("/")[0] : null);
 const prID = (pr) => ({ host: pr.host, repo: pr.repo, number: pr.number });
 
@@ -200,6 +203,11 @@ function parseRemote(url) {
   const m = url.match(/^(?:[a-z+]+:\/\/)?(?:[^@/]+@)?([^:/]+)[:/]([^/]+)\/([^/\s]+?)(?:\.git)?\/?$/i);
   return m ? { host: m[1].toLowerCase(), owner: m[2], name: m[3] } : null;
 }
+
+const repoOfSpec = (spec) => {
+  const [host, owner, name] = spec.split("/");
+  return { host, owner, name };
+};
 
 // Where a space is now: its first terminal's live folder, else where it was made.
 function place(s) {
@@ -210,6 +218,10 @@ function place(s) {
 export default class GitHub extends View {
   init(_props, cx) {
     const p = props() ?? {};
+    // When it opened, and the tabs that have shown rows since: how long the
+    // first rows take on each, logged once (render).
+    this.openedAt = Date.now();
+    this.firstRows = new Set();
     this.demo = Boolean(p.demo);
     this.screen = "list";
     this.tab = localStorage.getItem("tab") ?? "mine";
@@ -218,6 +230,10 @@ export default class GitHub extends View {
     this.at = 0;
     this.cur = null; // the PR open, as listed
     this.detail = null;
+    // What's shown in `detail`: when its request was sent (`at`), whether
+    // it's from the cache (`cached`: nothing may act on it), and why its
+    // refresh failed (`error`).
+    this.detailInfo = null;
     this.prTab = "overview"; // the PR screen's tab (PR_TABS)
     this.menu = null;
     this.parked = null; // a menu that came while Overview wasn't shown
@@ -226,15 +242,32 @@ export default class GitHub extends View {
     this.files = null; // the Files changed tab's view (files.js), one per PR opened
     this.flash = "";
     this.err = "";
+    this.statusErr = ""; // the last status error said (statusFailed): only it is cleared or replaced by status
+    // What must stay said (hold): a change not known to have gone when who
+    // changed. Shown above what's said now, until dismissed or the user
+    // leaves the screen it's on.
+    this.notices = [];
     this.busy = "";
     this.acting = new Set(); // the PRs (keys) a change was sent for, until GitHub answers
+    this.gate = new MutationGate(); // changes out, against which polls are ordered
     this.repo = null;
     this.picking = false; // the repo tab's list of repos
     this.repos = null;
     this.sessions = {};
     this.trees = JSON.parse(localStorage.getItem("trees") ?? "{}");
     this.login = "";
-    this.on = localStorage.getItem("on"); // the machine gh is signed in on ("" here)
+    this.on = null; // the machine gh is signed in on ("" here): the cache's, until status says
+    // The cache (store.js, cache.js). `who`: who status said is signed in,
+    // this opening; nothing is written before (`confirmed`), and `gen`
+    // moves on when who changes, so answers asked for before are dropped.
+    this.store = new Store();
+    this.stamp = stamper(Date.now);
+    this.cache = empty("lists");
+    this.who = null;
+    this.gen = 0;
+    this.signedOut = false; // why gen last moved (forget): a sign-out, not someone else
+    this.forgotSignOut = false; // this sign-out is forgotten already (statusFailed)
+    this.confirmed = new Promise((resolve) => (this.confirm = resolve));
     this.width = 900;
     this.from = p.back ?? null; // the mod it was opened from, to go back to
     // Where esc goes back to, when another mod opened it on a PR: that mod,
@@ -272,7 +305,21 @@ export default class GitHub extends View {
     filter.on("focus", (_e, cx) => this.files?.filterFocus(true, cx));
     filter.on("blur", (_e, cx) => this.files?.filterFocus(false, cx));
     filter.on("submit", (_e, cx) => this.files?.typingKey("enter", cx));
-    this.filesUI = { filter, diffScroll: VirtualListScrollHandle.new(), treeScroll: VirtualListScrollHandle.new(), height: PR_BODY_H };
+    // The composer's text box: grows with what's typed, 3 to 10 rows.
+    const composer = TextareaState.new({ placeholder: "Write a comment. Markdown works." });
+    composer.set_auto_grow(3, 10);
+    composer.on("change", (_e, cx) => this.files?.composerChanged(composer.value(), cx));
+    composer.on("focus", (_e, cx) => this.files?.composerFocus(true, cx));
+    composer.on("blur", (_e, cx) => this.files?.composerFocus(false, cx));
+    composer.on("submit", (e, cx) => this.files?.composerSubmit(e, cx));
+    // The submit dialog's text box: the review's own text.
+    const reviewBody = TextareaState.new({ placeholder: "Say something about the whole PR (optional)" });
+    reviewBody.set_auto_grow(3, 8);
+    reviewBody.on("change", (_e, cx) => this.files?.dialogBodyChanged(reviewBody.value(), cx));
+    reviewBody.on("focus", (_e, cx) => this.files?.dialogFocus(true, cx));
+    reviewBody.on("blur", (_e, cx) => this.files?.dialogFocus(false, cx));
+    reviewBody.on("submit", (e, cx) => this.files?.dialogSubmit(e, cx));
+    this.filesUI = { filter, composer, reviewBody, diffScroll: VirtualListScrollHandle.new(), treeScroll: VirtualListScrollHandle.new(), height: PR_BODY_H };
 
     cx.spawn(async (cx) => {
       await this.readCache(cx);
@@ -281,6 +328,36 @@ export default class GitHub extends View {
       cx.notify();
     });
     cx.timer.every(60000, (cx) => this.screen === "list" && !this.busy && this.loadAll(cx));
+    // The open PR's Files tab follows it (files.js decides when to read).
+    cx.timer.every(1000, (cx) => this.files?.tick(cx));
+    // Status not confirmed yet (it failed), or confirmed but its machine
+    // lost since (a person's search failed, `on` null: every automatic read
+    // fails until one is found): ask again, or nothing is kept and nothing
+    // is read. The one timer that looks while a PR is open: if it finds
+    // someone else, settle says so on the screen the user lands on.
+    cx.timer.every(60000, (cx) => {
+      if (this.demo || (this.who && this.on != null)) return;
+      cx.spawn(async (cx) => {
+        try {
+          await this.findGitHub();
+          // Only the status error goes: not what the Files tab said meanwhile.
+          if (this.err === this.statusErr) this.err = "";
+          this.statusErr = "";
+          this.loadMissing(cx);
+        } catch (e) {
+          this.statusFailed(e);
+        }
+        cx.notify();
+      });
+    });
+    // The row the cursor rests on: its detail, fetched ahead (warm).
+    this.rest = null;
+    this.warming = false;
+    this.settledGen = this.gen;
+    cx.timer.every(200, (cx) => {
+      this.settle(cx);
+      this.warmTick(cx);
+    });
 
     // Key bindings and `herdr-app do`: github.escape, github.tab,
     // github.backtab, github.demo, github.next, github.prev, github.reload.
@@ -292,6 +369,8 @@ export default class GitHub extends View {
         else if (c === "tab" || c === "backtab") this.press(c === "tab" ? "tab" : "shift-tab", cx);
         else if (c === "demo") {
           this.demo = !this.demo;
+          this.gen++;
+          this.notices = [];
           this.lists = {};
           this.screen = "list";
           this.repo = null;
@@ -307,24 +386,34 @@ export default class GitHub extends View {
   // ── where things run ───────────────────────────────────────────────────
 
   // The machine gh is signed in on: the one that answered last, else this
-  // one, else each connected one in turn.
-  async findGitHub() {
+  // one, else each connected one in turn. One search at a time: the lists
+  // asked for at once all wait on the same one.
+  findGitHub() {
+    return (this.finding ??= this.searchGitHub().finally(() => (this.finding = null)));
+  }
+
+  async searchGitHub() {
     const order = [this.on, "", ...machines().filter((m) => m.name && m.layout !== "unavailable").map((m) => m.name)];
     const tried = new Set();
     let last;
+    // The account the cache is from has signed out on its machine: said on
+    // whichever error is thrown last, not just that machine's.
+    let cachedSignedOut = false;
     for (const m of order) {
       if (m == null || tried.has(m)) continue;
       tried.add(m);
       try {
         const s = await ask({ op: "status" }, m || null);
-        const signed = s.hosts.find((h) => h.login);
-        if (!signed) {
+        const who = whoOf(m, s.hosts, Date.now());
+        if (!who) {
           last = new Error(s.hosts.map((h) => h.error).join("; ") || "gh isn't signed in");
+          // The account the cache is from has signed out there.
+          if (m === this.cachedWho()?.machine) cachedSignedOut = true;
           continue;
         }
         this.on = m;
-        this.login = signed.login;
-        localStorage.setItem("on", m);
+        this.login = who.hosts[0].login;
+        this.confirmWho(who);
         return m || null;
       } catch (e) {
         if (e instanceof DevError) throw e;
@@ -332,50 +421,240 @@ export default class GitHub extends View {
       }
     }
     this.on = null;
-    throw last ?? new Error("no machine answered");
+    const e = last ?? new Error("no machine answered");
+    e.cachedSignedOut = cachedSignedOut;
+    throw e;
   }
 
-  // One request where gh is signed in; `opts` go to exec (see ask).
-  /** @param {{ timeout?: number }} [opts] */
-  async gh(req, opts = {}) {
-    if (this.demo) return ask({ ...req, demo: true }, null, opts);
-    if (this.on == null || !this.login) await this.findGitHub();
-    try {
-      return await ask(req, this.on || null, opts);
-    } catch (e) {
-      if (e instanceof AppError || e instanceof TimedOut || e instanceof DevError) throw e;
-      // The machine went away, or herdr-github couldn't be fetched there: look again.
-      await this.findGitHub();
-      return ask(req, this.on || null, opts);
+  // The who of what's shown and kept: confirmed this opening, else the cache's.
+  cachedWho() {
+    return this.who ?? this.cache.who;
+  }
+
+  // Status said who is signed in. Another account than the one the cache
+  // (or this opening) had: nothing shown or kept from before is theirs, so
+  // it all goes, from the screen and both files, and the lists load again
+  // (load, when its old answer comes back dropped).
+  confirmWho(who) {
+    const was = this.cachedWho();
+    const same = was && sameWho(was, who);
+    this.who = same ? mergeWho(was, who) : who;
+    // Someone is signed in: status's error is over, and a later sign-out is
+    // a new one (statusFailed).
+    if (this.err === this.statusErr) this.err = "";
+    this.statusErr = "";
+    this.forgotSignOut = false;
+    if (was && !same) {
+      this.forget();
+      this.store.write("lists", { who });
+      this.store.write("details", { who });
+    }
+    this.confirm();
+  }
+
+  // Drops every list and cached detail shown, and every answer on its way.
+  // `signedOut`: nobody is signed in now (statusFailed), rather than someone
+  // else (confirmWho); settle says which.
+  forget(signedOut = false) {
+    this.signedOut = signedOut;
+    this.gen++;
+    this.lists = {};
+    this.cache = empty("lists", this.who);
+    this.forgetDetail();
+  }
+
+  // After forget() (which may run where there's no cx, inside a status
+  // search): a PR opened from a list that's gone goes back to the list; one
+  // opened straight (Recap, Linear) gets a fresh Files tab and asks for its
+  // detail again; the lists load. Every 200 ms, at no cost when nothing was
+  // forgotten.
+  //
+  // The Files tab's state (its pending review, "mine", the dialog) is the
+  // other account's, and a change made from it must not go as the new one
+  // (mutate refuses it too). What it had out is said not known before it
+  // goes, and held (hold) on the screen the user lands on: nothing said
+  // later replaces it. With nothing out, the user is still told why the
+  // screen changed under them (sent.js whoChangedSays).
+  settle(cx) {
+    if (this.settledGen === this.gen) return;
+    this.settledGen = this.gen;
+    if (this.screen === "pr" && this.cur) {
+      const note = this.files?.leave(this.signedOut) ?? "";
+      const says = whoChangedSays({ signedOut: this.signedOut, direct: this.direct, held: Boolean(note), statusErr: this.statusErr });
+      if (!this.direct) {
+        this.files = null;
+        this.toList(cx);
+      } else {
+        this.files = new FilesView(this, this.filesUI);
+        if (this.prTab === "files") this.files.loadFiles(cx);
+        // A live detail is the other account's as much as a cached one
+        // (forgetDetail's): gone, so nothing acts on it until the new one.
+        this.detail = null;
+        this.detailInfo = null;
+        this.menu = this.parked = null;
+        // Owed because who changed, not asked for: it never looks again.
+        if (says.reread) this.loadDetail(cx, "auto");
+        this.keys.focus();
+      }
+      if (note) this.hold(note, cx);
+      // After toList, which clears what's said.
+      if (says.err) this.say(says.err, cx, true);
+      else if (says.flash) this.say(says.flash, cx);
+    }
+    this.loadMissing(cx);
+    cx.notify();
+  }
+
+  // Status found no one signed in: said, and the cache's rows go if their
+  // account signed out. (A machine that didn't answer isn't a sign-out:
+  // what's shown stays, marked.)
+  //
+  // Said only over nothing or its own last word, never over another error
+  // (a Files tab change said not known): the 60 s re-ask would replace it.
+  statusFailed(e) {
+    const said = e instanceof DevError ? e.message : `Not signed in to GitHub on any machine: ${e?.message ?? e}. Run gh auth login on one.`;
+    if (!this.err || this.err === this.statusErr) this.err = said;
+    this.statusErr = said;
+    // Forgotten once per sign-out, said as one (settle): the 60 s re-ask
+    // finds the same sign-out each time until status finds someone, and
+    // who stays, so confirmWho still wipes the files if that's someone else.
+    if (!(e instanceof DevError) && e?.cachedSignedOut && !this.forgotSignOut) {
+      this.forgotSignOut = true;
+      this.forget(true);
     }
   }
 
+  // One request where gh is signed in; `opts` go to exec (see ask), but
+  // `why` it's asked (reads.js Why: "asked", "list", "auto") decides whether
+  // a failure may look for GitHub again, as the screen is when it fails.
+  /** @param {{ timeout?: number, why?: import("./reads.js").Why }} [opts] */
+  async gh(req, opts = {}) {
+    const { why = "list", ...execOpts } = opts;
+    if (this.demo) return ask({ ...req, demo: true }, null, execOpts);
+    return askSignedIn({
+      ask: () => ask(req, this.on || null, execOpts),
+      find: () => this.findGitHub(),
+      chosen: () => this.on != null && Boolean(this.login),
+      // The machine went away, or herdr-github couldn't be fetched there:
+      // look again. Not for GitHub's answer, a slow one, or a dev build's.
+      settled: (e) => e instanceof AppError || e instanceof TimedOut || e instanceof DevError,
+      look: () => this.mayLook(why),
+    });
+  }
+
+  // Whether a read made for `why` may look for GitHub now (reads.js).
+  /** @param {import("./reads.js").Why} why */
+  mayLook(why) {
+    return mayLook(why, this.screen === "pr");
+  }
+
+  // A change to GitHub, sent once (mutation.js): never asked again, here or
+  // on another machine. First, who it goes as is settled (mutation.js
+  // settleWho): status this opening, not the cache's, waited for when a
+  // search is out, and still the who it was `made` under (this.gen when the
+  // action started), else nothing is sent. Polls wait on this.gate while one
+  // is out.
+  /**
+   * @param {number} made
+   * @returns {Promise<import("./mutation.js").Outcome>}
+   */
+  async mutate(req, made) {
+    let machine = null;
+    const body = JSON.stringify(this.demo ? { ...req, demo: true } : req);
+    this.gate.begin();
+    try {
+      return await sendOnce({
+        who: this.demo ? undefined : {
+          finding: () => this.finding ?? null,
+          live: () => Boolean(this.who) && this.on != null && Boolean(this.login),
+          find: () => this.findGitHub(),
+          gen: () => this.gen,
+          made,
+        },
+        prepare: () => binary((machine = this.demo ? null : this.on || null)),
+        run: (bin) => exec("sh", ["-c", 'exec "$0" app "$1"', bin, body], { timeout: MUTATION_TIMEOUT, on: machine }),
+      });
+    } finally {
+      this.gate.end();
+    }
+  }
+
+  // Everything at once: who is signed in (status), the space's repo, and,
+  // when the cache says which machine answered last, the lists there.
   async start(cx) {
     this.err = "";
-    try {
-      if (!this.demo) await this.findGitHub();
-      else this.login = "sam";
-    } catch (e) {
-      this.err = e instanceof DevError ? e.message : `Not signed in to GitHub on any machine: ${e?.message ?? e}. Run gh auth login on one.`;
-      return cx.notify();
+    if (this.demo) {
+      this.login = "sam";
+      await this.lookForRepo(cx);
+      return this.loadAll(cx);
     }
-    await this.findRepo();
-    this.loadAll(cx);
+    const status = this.findGitHub();
+    const repo = this.lookForRepo(cx);
+    if (this.cache.who) this.loadAll(cx);
+    try {
+      await status;
+      this.loadMissing(cx);
+    } catch (e) {
+      this.statusFailed(e);
+    }
+    await repo;
+    cx.notify();
   }
 
-  // The repo tab's repo: the shown space's, from its remotes.
+  // The space the popup opened over, and its folder: where its repo is looked
+  // for, and the key its repo is remembered by (machine and folder).
+  openedSpace() {
+    if (this.space === undefined) {
+      const s = spaces().find((s) => s.active);
+      const folder = (s && place(s)) || null;
+      this.space = folder ? { machine: s.machine ?? null, folder, key: `${s.machine ?? ""}:${folder}` } : null;
+    }
+    return this.space;
+  }
+
+  // The repo tab's repo: the shown space's, from its remotes. { kind:
+  // "found", spec } | { kind: "none" }: no GitHub remote there | { kind:
+  // "failed" }: the machine didn't answer.
   async findRepo() {
-    if (this.demo) return (this.repo = this.repo ?? DEMO_REPO);
-    const s = spaces().find((s) => s.active);
-    const folder = s && place(s);
-    if (!folder) return;
-    const r = await exec("git", ["-C", folder, "remote", "-v"], { on: s.machine }).catch(() => null);
-    if (!r || r.code !== 0) return;
+    const sp = this.openedSpace();
+    if (!sp) return { kind: "none" };
+    const r = await exec("git", ["-C", sp.folder, "remote", "-v"], { on: sp.machine }).catch(() => null);
+    if (!r) return { kind: "failed" };
+    if (r.code !== 0) return { kind: "none" };
     const remotes = new Map(r.stdout.split("\n").map((l) => l.split(/\s+/)).filter((p) => p.length >= 2).map(([name, url]) => [name, url]));
     for (const name of ["upstream", "origin", ...remotes.keys()]) {
       const repo = remotes.has(name) && parseRemote(remotes.get(name));
-      if (repo) return (this.repo = repo);
+      if (repo) return { kind: "found", spec: `${repo.host}/${repo.owner}/${repo.name}` };
     }
+    return { kind: "none" };
+  }
+
+  // What the space's remotes say, against the repo remembered for it: the
+  // same, nothing changes; another, it's shown and loaded instead; none, the
+  // tab clears; no answer, the remembered one stays.
+  async lookForRepo(cx) {
+    if (this.demo) {
+      this.repo ??= DEMO_REPO;
+      return;
+    }
+    const found = await this.findRepo();
+    const sp = this.openedSpace();
+    const { spec, keep } = resolveRepo(sp ? this.cache.spaces[sp.key] : null, found);
+    if (keep) this.keepSpace(keep);
+    if (spec === (this.repoSpec() || null)) return;
+    this.repo = spec ? repoOfSpec(spec) : null;
+    this.lists.repo = null;
+    this.load("repo", cx);
+    cx.notify();
+  }
+
+  // The repo remembered for the space the popup opened over.
+  keepSpace(entry) {
+    const sp = this.openedSpace();
+    if (!sp) return;
+    const e = { ...entry, saved: Date.now() };
+    this.cache.spaces[sp.key] = e;
+    this.persist("lists", { spaces: { [sp.key]: e } });
   }
 
   repoSpec() {
@@ -384,40 +663,61 @@ export default class GitHub extends View {
 
   // ── lists ──────────────────────────────────────────────────────────────
 
-  loadAll(cx) {
-    for (const t of TABS) this.load(t.id, cx);
+  /** @param {import("./reads.js").Why} [why] */
+  loadAll(cx, why = "list") {
+    for (const t of TABS) this.load(t.id, cx, false, why);
+  }
+
+  // The tabs with no live answer and none on its way.
+  loadMissing(cx) {
+    for (const t of TABS) {
+      const l = this.lists[t.id];
+      if (!l?.loading && (!l?.loaded || l.cached || l.error)) this.load(t.id, cx);
+    }
+  }
+
+  // A tab's list, made empty if it has none. The repo tab's is for one repo
+  // (`spec`): another repo gets another list.
+  list(tab) {
+    return (this.lists[tab] ??= { prs: [], next: "", loaded: false, spec: tab === "repo" ? this.repoSpec() : "" });
   }
 
   // The lists as they were last time, shown at once on opening while fresh
-  // ones are asked for: a file in the app's folder (a shared value would
-  // redraw every mod each time it's set). Never the demo's.
+  // ones are asked for, on every tab: the repo tab's from the repo last
+  // found or picked for this space. Never the demo's.
   async readCache(cx) {
     if (this.demo) return;
-    this.cache = JSON.parse((await fs.readFile(CACHE, "utf8").catch(() => null)) ?? "{}");
-    this.login ||= this.cache.login ?? "";
-    for (const t of ["mine", "review"]) this.seed(t, this.cache.lists?.[t]);
+    this.cache = await this.store.read("lists");
+    const who = this.cache.who;
+    if (who) {
+      this.on ??= who.machine;
+      this.login ||= who.hosts[0].login;
+    }
+    for (const t of ["mine", "review"]) seed(this.list(t), this.cache.lists[t]);
+    const sp = this.openedSpace();
+    const kept = sp && this.cache.spaces[sp.key];
+    if (kept?.repo && !this.repo) {
+      this.repo = repoOfSpec(kept.repo);
+      seed(this.list("repo"), this.cache.repos[kept.repo]);
+    }
     cx.notify();
   }
 
-  seed(tab, kept) {
-    const l = this.lists[tab];
-    if (!kept || this.demo || (l?.loaded && !l.cached)) return;
-    this.lists[tab] = { ...l, prs: kept.prs ?? [], next: kept.next ?? "", loaded: true, cached: true, loading: l?.loading };
-  }
-
-  keep(tab, l) {
+  // A patch for a cache file, written once status has said who it's for,
+  // and only if who hasn't changed since it was made.
+  persist(kind, patch) {
     if (this.demo) return;
-    const c = (this.cache ??= {});
-    c.login = this.login;
-    c.lists ??= {};
-    if (tab === "repo") (c.repos ??= {})[this.repoSpec()] = { prs: l.prs, next: l.next };
-    else c.lists[tab] = { prs: l.prs, next: l.next };
-    fs.writeFile(CACHE, JSON.stringify(c)).catch(() => {});
+    const gen = this.gen;
+    this.confirmed.then(() => {
+      if (gen === this.gen && this.who) this.store.write(kind, { ...patch, who: this.who });
+    });
   }
 
-  load(tab, cx, more = false) {
-    if (tab === "repo" && !more && !this.lists.repo?.loaded) this.seed("repo", this.cache?.repos?.[this.repoSpec()]);
-    const l = (this.lists[tab] ??= { prs: [], next: "", loaded: false });
+  // `why` (reads.js): the lists' own, unless a change owes it ("auto").
+  /** @param {import("./reads.js").Why} [why] */
+  load(tab, cx, more = false, why = "list") {
+    if (tab === "repo" && !more && !this.lists.repo?.loaded) seed(this.list("repo"), this.cache.repos[this.repoSpec()]);
+    const l = this.list(tab);
     if (l.loading || (more && !l.next)) return;
     if (tab === "repo" && !this.repo) {
       l.loaded = true;
@@ -425,19 +725,43 @@ export default class GitHub extends View {
     }
     l.loading = true;
     cx.notify();
+    // The repo it's for, and who it's asked as, are what they are now: an
+    // answer that comes after either changed is kept as theirs, or dropped.
+    const spec = l.spec;
+    const gen = this.gen;
+    const early = !this.who;
+    const at = this.stamp();
     cx.spawn(async (cx) => {
+      const req = { op: "list", tab, repo: spec, cursor: more ? l.next : "" };
+      let res = null;
+      let err = null;
       try {
-        const res = await this.gh({ op: "list", tab, repo: this.repoSpec(), cursor: more ? l.next : "" });
+        res = await this.gh(req, { why }).catch(async (e) => {
+          // Asked on the cache's machine before status answered, and it's
+          // signed out there: ask again wherever status finds GitHub. Only
+          // for a read that may look (not while a PR is showing).
+          if (!early || !e?.signedOut || this.demo || !this.mayLook(why)) throw e;
+          await this.findGitHub();
+          return this.gh(req, { why });
+        });
+      } catch (e) {
+        err = e;
+      }
+      l.loading = false;
+      if (gen !== this.gen) {
+        this.loadMissing(cx);
+        return cx.notify();
+      }
+      if (err) l.error = err?.signedOut ? `Not signed in to ${err.signedOut === true ? "GitHub" : err.signedOut}: run gh auth login` : String(err?.message ?? err);
+      else {
         l.prs = more ? [...l.prs, ...res.prs] : res.prs;
         l.next = res.next;
         l.warning = res.warning ?? "";
         l.error = "";
-        l.cached = false;
-        if (!more) this.keep(tab, l);
-      } catch (e) {
-        l.error = e?.signedOut ? `Not signed in to ${e.signedOut === true ? "GitHub" : e.signedOut}: run gh auth login` : String(e?.message ?? e);
+        // A next page doesn't make the first one fresh.
+        if (!more) l.cached = false;
+        if (!more) this.persist("lists", listPatch(null, tab, spec, l, at));
       }
-      l.loading = false;
       l.loaded = true;
       cx.notify();
     });
@@ -446,7 +770,7 @@ export default class GitHub extends View {
   reload(cx) {
     if (this.screen === "pr") {
       if (this.prTab === "files") this.files?.reload(cx);
-      return this.loadDetail(cx);
+      return this.loadDetail(cx, "asked");
     }
     this.loadAll(cx);
   }
@@ -478,7 +802,10 @@ export default class GitHub extends View {
   enter(cx) {
     if (this.pickingRepo()) return this.pickRepo(this.shownRepos()[this.at], cx);
     const pr = this.shown?.[this.at];
-    if (pr) this.openPR(pr, cx);
+    if (!pr) return;
+    // The user leaves the list: what was held on it has been seen.
+    this.notices = [];
+    this.openPR(pr, cx);
   }
 
   // ── the repo tab's repos ───────────────────────────────────────────────
@@ -510,6 +837,8 @@ export default class GitHub extends View {
     if (!r) return;
     const [owner, name] = r.repo.split("/");
     this.repo = { host: r.host, owner, name };
+    // Remembered for this space until its remote changes.
+    if (!this.demo) this.keepSpace(pickedRepo(this.cache.spaces[this.openedSpace()?.key], this.repoSpec()));
     this.picking = false;
     this.at = 0;
     this.input.set_value("");
@@ -524,31 +853,129 @@ export default class GitHub extends View {
     this.screen = "pr";
     this.cur = pr;
     this.detail = null;
+    this.detailInfo = null;
     this.prTab = "overview";
     this.menu = this.parked = null;
     this.checkAt = 0;
     this.files = new FilesView(this, this.filesUI);
     this.err = this.flash = "";
     this.direct = direct;
-    this.loadDetail(cx);
+    this.loadDetail(cx, "asked");
+    this.showCachedDetail(pr, cx);
     this.loadSessions(cx);
     cx.timer.after(30, () => this.keys.focus());
     cx.notify();
   }
 
-  loadDetail(cx) {
+  // The open PR's detail. `why` (reads.js): "asked" when a person opened the
+  // PR or pressed r; "auto" when it's read again after a change or after
+  // who changed, which never looks for GitHub.
+  /** @param {import("./reads.js").Why} why */
+  loadDetail(cx, why) {
     const pr = this.cur;
+    const at = this.stamp();
+    const gen = this.gen;
+    const early = !this.who;
     cx.spawn(async (cx) => {
       try {
-        const d = await this.gh({ op: "detail", pr: prID(pr) });
-        if (this.cur?.key !== pr.key) return;
-        this.detail = d;
+        const d = await this.gh({ op: "detail", pr: prID(pr) }, { why });
+        // Asked as an account that's since changed: settle asks again.
+        if (gen !== this.gen) return;
+        this.keepDetail(pr.key, d, at);
+        if (!this.showDetail(pr.key, d, { at, cached: false, gen })) return;
         this.cur = { ...pr, ...d };
         this.replaceRow(d);
       } catch (e) {
-        if (this.cur?.key === pr.key) this.err = String(e?.message ?? e);
+        if (gen !== this.gen || this.screen !== "pr" || this.cur?.key !== pr.key) return;
+        // Asked on the cache's machine before status answered, and it's
+        // signed out there: once status finds GitHub, ask again (as load).
+        // Only for a read that may look.
+        if (early && e?.signedOut && !this.demo && this.mayLook(why)) {
+          const found = await this.findGitHub().then(() => true, () => false);
+          if (found && gen === this.gen && this.screen === "pr" && this.cur?.key === pr.key) return this.loadDetail(cx, why);
+        }
+        this.err = String(e?.message ?? e);
+        // A cached Overview stays, marked with why and how old; r tries again.
+        if (this.detailInfo?.cached) this.detailInfo.error = this.err;
       }
       cx.notify();
+    });
+  }
+
+  // `d`, as the detail of the PR open (`key`), if it may replace what's
+  // shown (cache.js takesOver): whether it did. Only the detail and what's
+  // known about it change, never the tab, the chosen check or the scroll.
+  // `info.gen`: who it was read as (the request's gen), so nothing acts on
+  // it once who has changed (canAct).
+  showDetail(key, d, info) {
+    if (this.screen !== "pr" || this.cur?.key !== key || !takesOver(this.detailInfo, info)) return false;
+    this.detail = d;
+    this.detailInfo = { at: info.at, cached: info.cached, error: "", gen: info.gen };
+    return true;
+  }
+
+  // The Overview kept from last time (or warmed), shown at once while the
+  // fresh one is asked for. Only if it's the shown account's.
+  showCachedDetail(pr, cx) {
+    if (this.demo) return;
+    const gen = this.gen;
+    cx.spawn(async (cx) => {
+      const doc = await this.store.read("details");
+      const e = doc.details[pr.key];
+      if (!e?.d || gen !== this.gen || !sameWho(doc.who, this.cachedWho())) return;
+      if (this.showDetail(pr.key, e.d, { at: e.saved, cached: true, gen })) cx.notify();
+    });
+  }
+
+  keepDetail(key, d, at) {
+    this.persist("details", { details: { [key]: { d, saved: at } } });
+  }
+
+  // An Overview from the cache, gone with the account it was from.
+  forgetDetail() {
+    if (!this.detailInfo?.cached) return;
+    this.detail = null;
+    this.detailInfo = null;
+  }
+
+  // Whether the PR shown may be acted on: never from a cached Overview (its
+  // fields may be stale, and choices are built from them). Says why not.
+  mayAct(cx) {
+    if (canAct(this.detail && { d: this.detail, ...this.detailInfo }, this.gen)) return true;
+    this.say(this.detail ? "Refreshing…" : "Still loading…", cx);
+    return false;
+  }
+
+  // Every 200 ms: once the cursor has rested 400 ms on a row whose detail
+  // isn't cached from the last 2 minutes, fetch it into the cache, one at a
+  // time. It touches the screen only as a cached Overview (showDetail), and
+  // never a list row.
+  warmTick(cx) {
+    if (this.demo || checking() || this.screen !== "list" || this.warming || !this.who) return;
+    const pr = this.shown?.[this.at];
+    if (this.rest?.key !== pr?.key) {
+      this.rest = pr ? { key: pr.key, since: Date.now(), done: false } : null;
+      return;
+    }
+    if (!this.rest || this.rest.done || Date.now() - this.rest.since < 400) return;
+    this.rest.done = true;
+    this.warming = true;
+    const gen = this.gen;
+    cx.spawn(async (cx) => {
+      try {
+        const doc = await this.store.read("details");
+        const e = doc.details[pr.key];
+        if (e && Date.now() - e.saved < 120000 && sameWho(doc.who, this.who)) return;
+        const at = this.stamp();
+        const d = await this.gh({ op: "detail", pr: prID(pr) });
+        if (gen !== this.gen) return;
+        this.keepDetail(pr.key, d, at);
+        if (this.showDetail(pr.key, d, { at, cached: true, gen })) cx.notify();
+      } catch {
+        // Warming is a convenience: opening the PR asks again.
+      } finally {
+        this.warming = false;
+      }
     });
   }
 
@@ -561,6 +988,8 @@ export default class GitHub extends View {
   }
 
   back(cx) {
+    // The user leaves the PR: what was held on it has been seen.
+    this.notices = [];
     if (this.direct && this.backTo) {
       this.dismiss();
       return openOverlay({ mod: this.backTo.mod, kind: "dialog", width: 0.8, height: 0.8, props: this.backTo.props ?? {} });
@@ -571,6 +1000,11 @@ export default class GitHub extends View {
       return run("mod.open", { name: "recap" });
     }
     this.direct = false;
+    this.toList(cx);
+  }
+
+  // The list again, on the row of the PR that was open.
+  toList(cx) {
     const key = this.cur?.key;
     this.screen = "list";
     this.menu = this.parked = null;
@@ -605,6 +1039,13 @@ export default class GitHub extends View {
       return cx.notify();
     }
     this.dismiss();
+  }
+
+  // The popup is going (closed, or the app quitting): drafts typed on the
+  // Files tab are written now, and onto disk before the 250 ms run out.
+  async close() {
+    this.files?.close();
+    await localStorage.flush();
   }
 
   dismiss() {
@@ -665,47 +1106,60 @@ export default class GitHub extends View {
     cx.notify();
   }
 
+  // Said and kept (sent.js noteLines): what `say` says next shows under it.
+  // It goes when the user dismisses it, or leaves the screen (back, enter).
+  hold(text, cx) {
+    if (!this.notices.includes(text)) this.notices.push(text);
+    cx.notify();
+  }
+
   // Changes the PR on GitHub, then reads it (and its lists) again. One
   // change to a PR at a time: a second d sent before the first answers
   // reads the draft state the first is changing.
   act(what, label, cx, after) {
+    if (!this.mayAct(cx)) return;
     const pr = this.cur;
     if (this.acting.has(pr.key)) return this.say(`#${pr.number} is still changing: one change at a time.`, cx);
+    // Built from the detail shown: it goes as the account that was read as,
+    // or not at all (mutation.js settleWho).
+    const made = this.detailInfo.gen;
     this.acting.add(pr.key);
     this.busy = label;
     this.menu = null;
     cx.notify();
     cx.spawn(async (cx) => {
-      let ok = false;
-      try {
-        const res = await this.gh({ op: "act", ...what, pr: prID(pr) });
-        this.say(res.note ?? "Done", cx);
-        ok = true;
-      } catch (e) {
-        this.say(String(e?.message ?? e), cx, true);
-      }
+      const r = await this.mutate({ op: "act", ...what, pr: prID(pr) }, made);
+      const ok = r.kind === "ok";
+      if (ok) this.say(r.answer.note ?? "Done", cx);
+      else if (r.kind === "refused") this.say(r.error, cx, true);
+      // Not known whether it went: held, so the reads below, failing, can't
+      // say over it.
+      else this.hold(`No answer about #${pr.number}. Check that PR before trying again.`, cx);
       this.acting.delete(pr.key);
       this.busy = "";
       // What follows (a merge's cleanup) is about this PR: only while it's
       // still the one shown, never another PR's or the list's.
       if (ok && after && this.screen === "pr" && this.cur?.key === pr.key) after(pr, cx);
-      this.loadDetail(cx);
-      this.loadAll(cx);
+      // Read again because of the change, not because anyone asked: a
+      // dropped exec here never looks for GitHub (reads.js), so it can't
+      // change who and take the user off the PR.
+      this.loadDetail(cx, "auto");
+      this.loadAll(cx, "auto");
       cx.notify();
     });
   }
 
   toggleDraft(cx) {
+    if (!this.mayAct(cx)) return;
     const d = this.detail;
-    if (!d) return this.say("Still loading…", cx);
     if (d.state !== "OPEN") return this.say(`#${d.number} is already ${d.state.toLowerCase()}.`, cx, true);
     this.act({ do: d.draft ? "ready" : "draft" }, d.draft ? "Marking it ready for review…" : "Making it a draft…", cx);
   }
 
   // The merge menu: herdr-github's choices; a confirmation for those that ask.
   mergeMenu(cx) {
+    if (!this.mayAct(cx)) return;
     const d = this.detail;
-    if (!d) return this.say("Still loading…", cx);
     if (d.mergeWhy) return this.say(d.mergeWhy.replace("mark it ready for review", "press d to mark it ready for review"), cx, true);
     const items = d.merge.map((c) => ({
       label: c.label,
@@ -722,10 +1176,12 @@ export default class GitHub extends View {
   // After a merge of `pr` (the PR shown): delete its branch on GitHub,
   // remove its worktree.
   cleanupMenu(pr, cx) {
+    if (!this.mayAct(cx)) return;
     const d = this.detail;
     const tree = this.treeOf(pr);
     const canDelete = d?.cleanup?.deleteBranch;
     if (!d || (!canDelete && !tree)) return;
+    const made = this.detailInfo.gen;
     const clean = (branch, wt) => (cx) => {
       this.busy = "Cleaning up…";
       cx.notify();
@@ -733,12 +1189,10 @@ export default class GitHub extends View {
         const done = [];
         const failed = [];
         if (branch) {
-          try {
-            await this.gh({ op: "act", do: "delete-branch", pr: prID(pr) });
-            done.push("branch deleted");
-          } catch (e) {
-            failed.push(`branch not deleted: ${e?.message ?? e}`);
-          }
+          const r = await this.mutate({ op: "act", do: "delete-branch", pr: prID(pr) }, made);
+          if (r.kind === "ok") done.push("branch deleted");
+          else if (r.kind === "refused") failed.push(`branch not deleted: ${r.error}`);
+          else failed.push("no answer about the branch: check the PR before trying again");
         }
         if (wt) {
           try {
@@ -982,7 +1436,7 @@ export default class GitHub extends View {
     if (k === "escape") {
       if (!e.is_held) this.escape(cx);
     } else if (this.filesTyping()) {
-      this.files.typingKey(k, cx);
+      this.files.typingKey(k, cx, Boolean(e.is_held));
       return cx.notify();
     } else if (!this.press(k, cx, Boolean(e.is_held))) return;
     cx.stop_propagation();
@@ -1246,7 +1700,9 @@ export default class GitHub extends View {
     }
     const l = this.lists[this.tab];
     const shown = this.shown;
-    if (l?.error) notes.push(this.note(o, l.error, o.fix));
+    // Rows from the cache say so, quietly: being refreshed, or why they
+    // couldn't be, and how old they are.
+    if (l?.error) notes.push(this.note(o, l.cached ? staleMark(true, l.saved, l.error) : l.error, o.fix));
     else if (!shown.length) {
       const empty = this.err ? "" : !l?.loaded || l.loading ? "Loading…" : this.filter ? "No pull request matches." : this.tab === "review" ? "Nothing waiting on your review." : "No open pull requests.";
       if (empty) notes.push(this.note(o, empty));
@@ -1263,6 +1719,7 @@ export default class GitHub extends View {
       entries.push({ key: `pr-${pr.key}`, row: i, h: CARD_H, el: () => div().h(CARD_H).pb(2).child(this.card(o, pr, i === this.at, i)) });
     });
     if (l?.next) after.push(div().px(14).py(6).text_size(12).text_color(o.dim).child(l.loading ? "Loading more…" : "More below: ↓ loads them"));
+    if (l?.cached && !l.error && shown.length) after.push(div().px(14).py(6).text_size(11.5).text_color(o.dim).child(staleMark(true, l.saved, "", this.who == null || Boolean(l.loading))));
     if (l?.warning) after.push(div().px(14).py(6).text_size(11.5).text_color(o.dim).child(l.warning));
     return { notes, entries, after };
   }
@@ -1297,13 +1754,22 @@ export default class GitHub extends View {
   // The PR screen: what it is (state, title, author, branch, size), its
   // tabs, and the shown tab, every tab as tall so switching never jumps.
   prView(o) {
-    const pr = this.cur;
+    // Opened straight on a PR, `cur` has only its number: the header reads
+    // the detail too, cached or not (it never goes into `cur` or the lists).
+    const pr = this.direct && this.detail ? { ...this.cur, ...this.detail } : this.cur;
     const d = this.detail;
+    const info = this.detailInfo;
+    const mark = staleMark(Boolean(info?.cached), info?.at, info?.error ?? "");
+    // The mark is about the Overview's cache: shown with it, and cut short
+    // (an error can be long) so the review chip stays whole.
+    const shownMark = this.prTab === "overview" ? mark : "";
     const look = prLook(o, pr);
     const stateWord = pr.state === "MERGED" ? "Merged" : pr.state === "CLOSED" ? "Closed" : pr.draft ? "Draft" : pr.state ? "Open" : "";
     const now = Date.now();
     const from = this.direct && this.backTo?.label ? this.backTo.label : this.direct && this.from === "recap" ? "Recap" : this.tabLabel(TABS.find((x) => x.id === this.tab), true);
     const body = this.prTab === "checks" ? this.checksTab(o) : this.prTab === "files" ? this.files.view(o) : this.overviewTab(o);
+    // The pending review, as the Files tab last read it (absent until it has).
+    const chipText = this.files ? reviewChip(this.files.review, Boolean(this.files.data?.more)) : "";
 
     return v_flex().flex_1().min_h(0).gap(10)
       .child(
@@ -1316,7 +1782,9 @@ export default class GitHub extends View {
           .child(div().font_family(MONO).text_size(12.5).text_color(o.muted).child(`#${pr.number}`))
           .child(div().text_size(12.5).text_color(o.dim).child(pr.repo))
           .child(div().flex_1())
-          .when(Boolean(pr.updated), (el) => el.child(div().text_size(12).text_color(o.dim).child(`updated ${ago(pr.updated, now)}`))),
+          .when(Boolean(chipText), (el) => el.child(chip(o, "review", [icon("pr", o.work, 12), chipText], { color: o.work })))
+          .when(Boolean(shownMark), (el) => el.child(div().min_w(0).truncate().text_size(12).text_color(info?.error ? o.fix : o.dim).child(shownMark)))
+          .when(Boolean(pr.updated) && !shownMark, (el) => el.child(div().text_size(12).text_color(o.dim).child(`updated ${ago(pr.updated, now)}`))),
       )
       .child(div().flex_none().text_size(17).font_semibold().text_color(o.fg).line_height(1.35).child(pr.title))
       .when(Boolean(d), (el) => el.child(
@@ -1534,8 +2002,9 @@ export default class GitHub extends View {
     if (this.screen === "pr") {
       const tabs = k(["1", "2", "3"], "tabs", (cx) => this.setPrTab(tabFor("tab", this.prTab), cx), "f-tabs");
       const back = k(["esc"], "back", (cx) => this.escape(cx), "f-esc");
-      // While its filter has the keyboard, 1 2 3 and esc are the filter's.
-      if (this.prTab === "files") return this.files.typing ? this.files.footer(k) : [...this.files.footer(k), tabs, back];
+      // While a text box of its has the keyboard (or it asks something), 1 2
+      // 3 and esc are its own.
+      if (this.prTab === "files") return this.files.typing || this.files.modal() ? this.files.footer(k) : [...this.files.footer(k), tabs, back];
       if (this.prTab === "checks") {
         return [
           k(["↑", "↓"], "choose", () => {}, "f-ch"),
@@ -1567,14 +2036,33 @@ export default class GitHub extends View {
     ];
   }
 
+  // One line at the foot (sent.js noteLines). A held one isn't cut short
+  // (what's not known is at its end), and has its own ×, which dismisses it.
+  noteView(o, n, i) {
+    const color = n.kind === "busy" ? o.accent : n.kind === "flash" ? o.muted : o.fix;
+    const text = div().flex_1().min_w(0).text_size(12).text_color(color).child(n.text);
+    return h_flex().flex_none().gap(8).items_center()
+      .when(n.kind === "busy", (el) => el.child(icon("work", o.accent, 12).spin(1100)))
+      .child(n.kind === "held" ? text : text.truncate())
+      .when(n.kind === "held", (el) => el.child(h_flex().id(`notice-${i}`).flex_none().p(2).rounded(4).cursor_pointer().hover((s) => s.bg(o.raised))
+        .on_click((_e, cx) => {
+          this.notices = this.notices.filter((t) => t !== n.text);
+          cx.notify();
+        })
+        .child(icon("cross", o.muted, 12))));
+  }
+
   render() {
     const t = theme();
     const o = tones(t);
     this.shown = this.shownList();
     if (this.screen === "list" && !this.pickingRepo()) this.at = Math.max(0, Math.min(this.at, this.shown.length - 1));
+    if (this.screen === "list" && this.shown.length && !this.firstRows.has(this.tab)) {
+      this.firstRows.add(this.tab);
+      console.log(`github: first rows on ${this.tab} ${Date.now() - this.openedAt}ms after opening${this.lists[this.tab]?.cached ? " (cached)" : ""}`);
+    }
     const summary = this.demo ? "Demo · made-up org" : this.login ? `${this.login}${this.on ? ` · on ${this.on}` : ""}` : "";
-    const note = this.busy || this.err || this.flash;
-    const noteColor = this.busy ? o.accent : this.err ? o.fix : o.muted;
+    const notes = noteLines({ held: this.notices, busy: this.busy, err: this.err, flash: this.flash });
     const pr = this.screen === "pr" && this.cur;
 
     return v_flex()
@@ -1606,9 +2094,7 @@ export default class GitHub extends View {
         .child(this.listView(o)))
       .when(Boolean(pr), (el) => el.child(this.prView(o)))
       .when(this.menuShown(), (el) => el.child(this.menuView(o)))
-      .when(Boolean(note), (el) => el.child(h_flex().flex_none().gap(8).items_center()
-        .when(Boolean(this.busy), (el) => el.child(icon("work", o.accent, 12).spin(1100)))
-        .child(div().flex_1().min_w(0).truncate().text_size(12).text_color(noteColor).child(note))))
+      .children(notes.map((n, i) => this.noteView(o, n, i)))
       .child(h_flex().flex_none().gap(14).flex_wrap().items_center().pt(8).border_t_1().border_color(o.line).children(this.footer(o)));
   }
 }

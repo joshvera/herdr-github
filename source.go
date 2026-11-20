@@ -45,11 +45,15 @@ type source interface {
 	// as repo and number, not a pullRequest, so they need no list or detail
 	// query first. head is the commit the caller was looking at.
 	files(ctx context.Context, r repoRef, number int) (filesAnswer, error)
+	// threads is the cheap poll: files' threads, PR and pending review only.
+	threads(ctx context.Context, r repoRef, number int) (threadsAnswer, error)
 	// diff answers state "stale" (not an error) when the PR's head isn't head.
 	diff(ctx context.Context, r repoRef, number int, head, path string) (diffAnswer, error)
 	// setViewed fails with a *staleError, without marking anything, when the
 	// PR's head isn't head.
 	setViewed(ctx context.Context, r repoRef, number int, head, path string, viewed bool) error
+	// reviewSource is the review actions on the Files changed tab (review.go).
+	reviewSource
 	// repos pages through the repos you can reach, for the repo list:
 	// the first page with cursor "", then each page's next until it's "".
 	repos(ctx context.Context, cursor string) ([]repoInfo, string, error)
@@ -210,6 +214,10 @@ func (s *githubSource) deleteBranch(ctx context.Context, d *prDetail) error {
 
 func (s *githubSource) files(ctx context.Context, r repoRef, number int) (filesAnswer, error) {
 	return s.client(r.Host).files(ctx, r, number)
+}
+
+func (s *githubSource) threads(ctx context.Context, r repoRef, number int) (threadsAnswer, error) {
+	return s.client(r.Host).threads(ctx, r, number)
 }
 
 func (s *githubSource) diff(ctx context.Context, r repoRef, number int, head, path string) (diffAnswer, error) {

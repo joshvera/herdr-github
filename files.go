@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -23,12 +24,54 @@ const (
 
 // ── what the mod gets ─────────────────────────────────────────────────────────
 
-// filesAnswer is the `files` op's answer.
+// threadsAnswer is the `threads` op's answer, the cheap poll: the PR's
+// review threads and the viewer's pending review, from one head.
+type threadsAnswer struct {
+	Head string `json:"head"`
+	PR   prInfo `json:"pr"`
+	// The viewer's pending review; null when there's none, left out when
+	// GitHub didn't say (a partial answer).
+	Review answered[reviewInfo] `json:"review,omitzero"`
+	// The viewer's latest submitted review; null when there's none, left
+	// out when GitHub didn't say.
+	Submitted answered[submittedInfo] `json:"submitted,omitzero"`
+	Threads   []fileThread            `json:"threads"`
+	More      bool                    `json:"more"` // there's more than was fetched: counts are lower bounds
+}
+
+// answered is what a read said of one thing: Val, nil for none, when Known.
+// Not known (a partial answer whose read of it came back null) leaves its
+// key out of the answer, so the mod keeps what it had; a null would say
+// there's none, and "your pending review is gone" reads as "submitted".
+type answered[T any] struct {
+	Val   *T
+	Known bool
+}
+
+func known[T any](v *T) answered[T] { return answered[T]{Val: v, Known: true} }
+
+func (a answered[T]) IsZero() bool { return !a.Known }
+
+func (a answered[T]) MarshalJSON() ([]byte, error) { return json.Marshal(a.Val) }
+
+// UnmarshalJSON: a key that's there is known, null or not.
+func (a *answered[T]) UnmarshalJSON(b []byte) error {
+	a.Known = true
+	return json.Unmarshal(b, &a.Val)
+}
+
+// filesAnswer is the `files` op's answer: what `threads` has, and the files.
 type filesAnswer struct {
-	Head    string       `json:"head"`
-	Files   []fileEntry  `json:"files"`
-	Threads []fileThread `json:"threads"`
-	More    bool         `json:"more"` // there's more than was fetched: counts are lower bounds
+	threadsAnswer
+	Files []fileEntry `json:"files"`
+}
+
+// prInfo is what the review actions need of the PR itself. Mine: the viewer
+// wrote it. State is open, closed or merged.
+type prInfo struct {
+	ID    string `json:"id"`
+	Mine  bool   `json:"mine"`
+	State string `json:"state"`
 }
 
 // fileEntry is one changed file. Viewed is viewed, unviewed or dismissed
@@ -61,17 +104,72 @@ type fileThread struct {
 	Resolved     bool            `json:"resolved"`
 	Outdated     bool            `json:"outdated"`
 	Comments     []threadComment `json:"comments"`
+	// What the viewer may do to it, as GitHub says.
+	CanReply     bool `json:"canReply"`
+	CanResolve   bool `json:"canResolve"`
+	CanUnresolve bool `json:"canUnresolve"`
 }
 
 // threadComment's State is submitted, or pending: the signed-in person's own
-// unsent review comment.
+// unsent review comment. Mine: the viewer wrote it.
 type threadComment struct {
-	ID      string `json:"id"`
-	Author  string `json:"author"`
-	Body    string `json:"body"`
-	Created int64  `json:"created"` // ms since the epoch
-	State   string `json:"state"`
-	URL     string `json:"url"`
+	ID        string `json:"id"`
+	Author    string `json:"author"`
+	Body      string `json:"body"`
+	Created   int64  `json:"created"` // ms since the epoch
+	State     string `json:"state"`
+	URL       string `json:"url"`
+	Mine      bool   `json:"mine"`
+	CanEdit   bool   `json:"canEdit"`
+	CanDelete bool   `json:"canDelete"`
+}
+
+// reviewInfo is the viewer's pending review: its body, how many comments it
+// holds, and the commit it's pinned to.
+type reviewInfo struct {
+	ID       string `json:"id"`
+	Body     string `json:"body"`
+	Comments int    `json:"comments"`
+	Commit   string `json:"commit"`
+}
+
+// submittedInfo is the viewer's latest submitted review on the PR. A
+// submit with no pending review whose outcome wasn't known is checked
+// against it: a new one means it went through (spec A6). State is
+// commented, approved, changes_requested or dismissed; At is when GitHub
+// says it was submitted, in ms since the epoch.
+type submittedInfo struct {
+	ID    string `json:"id"`
+	State string `json:"state"`
+	At    int64  `json:"at"`
+}
+
+// gqlSubmitted is a review as the `submitted` read has it.
+type gqlSubmitted struct {
+	ID              string  `json:"id"`
+	State           string  `json:"state"`
+	ViewerDidAuthor bool    `json:"viewerDidAuthor"`
+	SubmittedAt     *string `json:"submittedAt"`
+}
+
+// submittedOf is the viewer's latest submitted review among reviews, or
+// nil. reviews(author:) takes a login, so the filter is viewerDidAuthor; a
+// pending review has no submittedAt.
+func submittedOf(reviews []gqlSubmitted) *submittedInfo {
+	var out *submittedInfo
+	for _, r := range reviews {
+		if !r.ViewerDidAuthor || strings.EqualFold(r.State, "PENDING") || r.SubmittedAt == nil {
+			continue
+		}
+		at, err := time.Parse(time.RFC3339, *r.SubmittedAt)
+		if err != nil {
+			continue
+		}
+		if out == nil || at.UnixMilli() >= out.At {
+			out = &submittedInfo{ID: r.ID, State: strings.ToLower(r.State), At: at.UnixMilli()}
+		}
+	}
+	return out
 }
 
 // diffAnswer is the `diff` op's answer.
@@ -95,12 +193,15 @@ type gqlFile struct {
 }
 
 type gqlComment struct {
-	ID        string    `json:"id"`
-	Author    *actor    `json:"author"`
-	Body      string    `json:"body"`
-	CreatedAt time.Time `json:"createdAt"`
-	State     string    `json:"state"`
-	URL       string    `json:"url"`
+	ID              string    `json:"id"`
+	Author          *actor    `json:"author"`
+	Body            string    `json:"body"`
+	CreatedAt       time.Time `json:"createdAt"`
+	State           string    `json:"state"`
+	URL             string    `json:"url"`
+	ViewerDidAuthor bool      `json:"viewerDidAuthor"`
+	ViewerCanUpdate bool      `json:"viewerCanUpdate"`
+	ViewerCanDelete bool      `json:"viewerCanDelete"`
 }
 
 type gqlThread struct {
@@ -114,7 +215,11 @@ type gqlThread struct {
 	DiffSide      string `json:"diffSide"`
 	StartDiffSide string `json:"startDiffSide"`
 	SubjectType   string `json:"subjectType"`
-	Comments      struct {
+	// What the viewer may do to it.
+	ViewerCanReply     bool `json:"viewerCanReply"`
+	ViewerCanResolve   bool `json:"viewerCanResolve"`
+	ViewerCanUnresolve bool `json:"viewerCanUnresolve"`
+	Comments           struct {
 		PageInfo struct {
 			HasNextPage bool `json:"hasNextPage"`
 		} `json:"pageInfo"`
@@ -128,15 +233,83 @@ type gqlThread struct {
 	} `json:"hunk"`
 }
 
+// gqlReview is a review as GraphQL has it. Commit is the commit it's pinned
+// to (null for a review whose commit is gone).
+type gqlReview struct {
+	ID              string `json:"id"`
+	Body            string `json:"body"`
+	State           string `json:"state"`
+	ViewerDidAuthor bool   `json:"viewerDidAuthor"`
+	Commit          *struct {
+		Oid string `json:"oid"`
+	} `json:"commit"`
+	Comments struct {
+		TotalCount int `json:"totalCount"`
+	} `json:"comments"`
+}
+
+// info is the review as the mod gets it.
+func (g gqlReview) info() *reviewInfo {
+	r := &reviewInfo{ID: g.ID, Body: g.Body, Comments: g.Comments.TotalCount}
+	if g.Commit != nil {
+		r.Commit = g.Commit.Oid
+	}
+	return r
+}
+
+// pending says whether it's an unsubmitted review.
+func (g gqlReview) pending() bool { return strings.EqualFold(g.State, "PENDING") }
+
+// pendingOf is the viewer's own pending review among reviews, or nil. GitHub
+// allows one per person per PR; reviews(author:) takes a login, not "the
+// viewer", so the filter is viewerDidAuthor.
+func pendingOf(reviews []gqlReview) *reviewInfo {
+	for _, r := range reviews {
+		if r.ViewerDidAuthor && r.pending() {
+			return r.info()
+		}
+	}
+	return nil
+}
+
+// The fields every read and mutation payload asks for, so a comment, thread
+// or review is the same shape whichever answer it came in.
+const (
+	commentFields = `id author { login } body createdAt state url viewerDidAuthor viewerCanUpdate viewerCanDelete`
+	threadFields  = `id isResolved isOutdated path line startLine originalLine diffSide startDiffSide subjectType
+          viewerCanReply viewerCanResolve viewerCanUnresolve
+          comments(first: 50) {
+            pageInfo { hasNextPage }
+            nodes { ` + commentFields + ` }
+          }
+          hunk: comments(first: 1) { nodes { diffHunk } }`
+	reviewFields = `id body state viewerDidAuthor commit { oid } comments { totalCount }`
+	// pendingReviews are the PR's pending reviews the viewer can see: only
+	// their own, but filtered on viewerDidAuthor all the same (pendingOf).
+	pendingReviews = `reviews(states: PENDING, first: 20) ` + pendingReviewNodes
+	// pendingReviewNodes is pendingReviews' selection set, apart so a
+	// directive can go between the two (GraphQL wants it before the braces).
+	pendingReviewNodes = `{ nodes { ` + reviewFields + ` } }`
+	// submittedReviewNodes is the `submitted` read's selection set: the PR's
+	// last reviews (the viewer's among them), as submittedOf wants them.
+	submittedReviewNodes = `{ nodes { id state viewerDidAuthor submittedAt } }`
+)
+
 type pageInfo struct {
 	HasNextPage bool   `json:"hasNextPage"`
 	EndCursor   string `json:"endCursor"`
 }
 
-const filesQuery = `query($owner: String!, $name: String!, $n: Int!, $files: Boolean!, $fa: String, $threads: Boolean!, $ta: String) {
+// filesQuery reads a page of files and of threads, and (on the first page,
+// $review) the PR and the viewer's pending review.
+const filesQuery = `query($owner: String!, $name: String!, $n: Int!, $review: Boolean!, $files: Boolean!, $fa: String, $threads: Boolean!, $ta: String) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $n) {
       id headRefOid
+      viewerDidAuthor @include(if: $review)
+      state @include(if: $review)
+      reviews(states: PENDING, first: 20) @include(if: $review) ` + pendingReviewNodes + `
+      submitted: reviews(last: 10) @include(if: $review) ` + submittedReviewNodes + `
       files(first: 100, after: $fa) @include(if: $files) {
         pageInfo { hasNextPage endCursor }
         nodes { path additions deletions changeType viewerViewedState }
@@ -144,34 +317,34 @@ const filesQuery = `query($owner: String!, $name: String!, $n: Int!, $files: Boo
       reviewThreads(first: 100, after: $ta) @include(if: $threads) {
         pageInfo { hasNextPage endCursor }
         nodes {
-          id isResolved isOutdated path line startLine originalLine diffSide startDiffSide subjectType
-          comments(first: 50) {
-            pageInfo { hasNextPage }
-            nodes { id author { login } body createdAt state url }
-          }
-          hunk: comments(first: 1) { nodes { diffHunk } }
+          ` + threadFields + `
         }
       }
     }
   }
 }`
 
-// prFiles is what GraphQL has of a PR's files and threads, from one head.
+// prFiles is what GraphQL has of a PR's files and threads, from one head,
+// and the viewer's pending review.
 type prFiles struct {
-	ID, Head string
-	Files    []gqlFile
-	Threads  []gqlThread
-	More     bool
+	ID, Head  string
+	PR        prInfo
+	Review    answered[reviewInfo]
+	Submitted answered[submittedInfo]
+	Files     []gqlFile
+	Threads   []gqlThread
+	More      bool
 }
 
 // errMoved: the head changed between two pages.
 var errMoved = errors.New("the pull request changed while loading")
 
-// loadFiles reads the PR's files and threads, page by page. If a push lands
-// between pages it starts over once; a second time it gives up.
-func (c *ghClient) loadFiles(ctx context.Context, r repoRef, number int) (*prFiles, error) {
+// loadFiles reads the PR's threads, and its files when withFiles, page by
+// page. If a push lands between pages it starts over once (it's a read); a
+// second time it gives up.
+func (c *ghClient) loadFiles(ctx context.Context, r repoRef, number int, withFiles bool) (*prFiles, error) {
 	for attempt := 0; attempt < 2; attempt++ {
-		g, err := c.loadFilesOnce(ctx, r, number)
+		g, err := c.loadFilesOnce(ctx, r, number, withFiles)
 		if !errors.Is(err, errMoved) {
 			return g, err
 		}
@@ -179,17 +352,25 @@ func (c *ghClient) loadFiles(ctx context.Context, r repoRef, number int) (*prFil
 	return nil, errors.New("the pull request changed while loading; press r")
 }
 
-func (c *ghClient) loadFilesOnce(ctx context.Context, r repoRef, number int) (*prFiles, error) {
+func (c *ghClient) loadFilesOnce(ctx context.Context, r repoRef, number int, withFiles bool) (*prFiles, error) {
 	var out prFiles
-	needFiles, needThreads := true, true
+	needFiles, needThreads := withFiles, true
 	var fileAfter, threadAfter any // nil until there's a cursor
 	for round := 0; needFiles || needThreads; round++ {
 		var res struct {
 			Repository *struct {
 				PullRequest *struct {
-					ID         string `json:"id"`
-					HeadRefOid string `json:"headRefOid"`
-					Files      *struct {
+					ID              string `json:"id"`
+					HeadRefOid      string `json:"headRefOid"`
+					ViewerDidAuthor bool   `json:"viewerDidAuthor"`
+					State           string `json:"state"`
+					Reviews         *struct {
+						Nodes []gqlReview `json:"nodes"`
+					} `json:"reviews"`
+					Submitted *struct {
+						Nodes []gqlSubmitted `json:"nodes"`
+					} `json:"submitted"`
+					Files *struct {
 						PageInfo pageInfo  `json:"pageInfo"`
 						Nodes    []gqlFile `json:"nodes"`
 					} `json:"files"`
@@ -201,7 +382,7 @@ func (c *ghClient) loadFilesOnce(ctx context.Context, r repoRef, number int) (*p
 			} `json:"repository"`
 		}
 		err := c.graphql(ctx, filesQuery, map[string]any{
-			"owner": r.Owner, "name": r.Name, "n": number,
+			"owner": r.Owner, "name": r.Name, "n": number, "review": round == 0,
 			"files": needFiles, "fa": fileAfter, "threads": needThreads, "ta": threadAfter,
 		}, &res)
 		// A partial answer (a team the token can't see, say) still shows, and
@@ -219,6 +400,20 @@ func (c *ghClient) loadFilesOnce(ctx context.Context, r repoRef, number int) (*p
 		}
 		if round == 0 {
 			out.ID, out.Head = pr.ID, pr.HeadRefOid
+			out.PR = prInfo{ID: pr.ID, Mine: pr.ViewerDidAuthor, State: strings.ToLower(pr.State)}
+			// Null only in a partial answer (asked for, so a full answer
+			// has them): then not known, rather than none. Nor is "none
+			// found" in a partial answer: a null node may be the one.
+			if pr.Reviews != nil {
+				if rv := pendingOf(pr.Reviews.Nodes); rv != nil || err == nil {
+					out.Review = known(rv)
+				}
+			}
+			// The latest submitted is known only from a whole answer: in a
+			// partial one, a null node may be later than any found.
+			if pr.Submitted != nil && err == nil {
+				out.Submitted = known(submittedOf(pr.Submitted.Nodes))
+			}
 		} else if pr.HeadRefOid != out.Head {
 			return nil, errMoved
 		}
@@ -288,6 +483,7 @@ func shapeThread(g gqlThread) fileThread {
 		ID: g.ID, Path: g.Path, Subject: lowerOr(g.SubjectType, "line"), Line: g.Line,
 		Side: lowerOr(g.DiffSide, "right"), OriginalLine: g.OriginalLine,
 		Resolved: g.IsResolved, Outdated: g.IsOutdated, Comments: []threadComment{},
+		CanReply: g.ViewerCanReply, CanResolve: g.ViewerCanResolve, CanUnresolve: g.ViewerCanUnresolve,
 	}
 	if startSide := lowerOr(g.StartDiffSide, t.Side); g.StartLine != 0 && (g.StartLine != g.Line || startSide != t.Side) {
 		t.StartLine, t.StartSide = g.StartLine, startSide
@@ -296,21 +492,29 @@ func shapeThread(g gqlThread) fileThread {
 		t.Hunk = g.Hunk.Nodes[0].DiffHunk
 	}
 	for _, c := range g.Comments.Nodes {
-		author := "ghost"
-		if c.Author != nil {
-			author = c.Author.Login
-		}
-		var created int64
-		if !c.CreatedAt.IsZero() {
-			created = c.CreatedAt.UnixMilli()
-		}
-		state := "submitted"
-		if strings.EqualFold(c.State, "PENDING") {
-			state = "pending"
-		}
-		t.Comments = append(t.Comments, threadComment{ID: c.ID, Author: author, Body: c.Body, Created: created, State: state, URL: c.URL})
+		t.Comments = append(t.Comments, shapeComment(c))
 	}
 	return t
+}
+
+// shapeComment is a comment as the mod gets it.
+func shapeComment(c gqlComment) threadComment {
+	author := "ghost"
+	if c.Author != nil {
+		author = c.Author.Login
+	}
+	var created int64
+	if !c.CreatedAt.IsZero() {
+		created = c.CreatedAt.UnixMilli()
+	}
+	state := "submitted"
+	if strings.EqualFold(c.State, "PENDING") {
+		state = "pending"
+	}
+	return threadComment{
+		ID: c.ID, Author: author, Body: c.Body, Created: created, State: state, URL: c.URL,
+		Mine: c.ViewerDidAuthor, CanEdit: c.ViewerCanUpdate, CanDelete: c.ViewerCanDelete,
+	}
 }
 
 // orderThreads puts threads in file order, then line order (a thread with no
@@ -364,18 +568,26 @@ func filesFrom(g *prFiles, rest []restFile) filesAnswer {
 			from[clean(f.Filename, false)] = clean(f.PreviousFilename, false)
 		}
 	}
-	out := filesAnswer{Head: g.Head, Files: []fileEntry{}, Threads: []fileThread{}, More: g.More}
+	out := filesAnswer{threadsAnswer: threadsFrom(g), Files: []fileEntry{}}
 	for _, f := range g.Files {
 		out.Files = append(out.Files, fileEntry{
 			Path: f.Path, From: from[f.Path], Status: fileStatus(f.ChangeType),
 			Additions: f.Additions, Deletions: f.Deletions, Viewed: viewedState(f.ViewerViewedState),
 		})
 	}
+	orderThreads(out.Files, out.Threads)
+	tallyThreads(out.Files, out.Threads)
+	return out
+}
+
+// threadsFrom is the `threads` answer for what GraphQL has: threads in path
+// order, then line order (filesFrom puts them in file order after).
+func threadsFrom(g *prFiles) threadsAnswer {
+	out := threadsAnswer{Head: g.Head, PR: g.PR, Review: g.Review, Submitted: g.Submitted, Threads: []fileThread{}, More: g.More}
 	for _, t := range g.Threads {
 		out.Threads = append(out.Threads, shapeThread(t))
 	}
-	orderThreads(out.Files, out.Threads)
-	tallyThreads(out.Files, out.Threads)
+	orderThreads(nil, out.Threads)
 	return out
 }
 
@@ -386,7 +598,7 @@ func filesFrom(g *prFiles, rest []restFile) filesAnswer {
 // REST can't be had (or the head moved while it was read), From stays empty.
 func (c *ghClient) files(ctx context.Context, r repoRef, number int) (filesAnswer, error) {
 	before := time.Now()
-	g, err := c.loadFiles(ctx, r, number)
+	g, err := c.loadFiles(ctx, r, number, true)
 	if err != nil {
 		return filesAnswer{}, err
 	}
@@ -395,6 +607,16 @@ func (c *ghClient) files(ctx context.Context, r repoRef, number int) (filesAnswe
 		return filesAnswer{}, ctx.Err()
 	}
 	return filesFrom(g, rest), nil
+}
+
+// threads answers the `threads` op: no files, no REST, one GraphQL request
+// per page of threads (most PRs need one).
+func (c *ghClient) threads(ctx context.Context, r repoRef, number int) (threadsAnswer, error) {
+	g, err := c.loadFiles(ctx, r, number, false)
+	if err != nil {
+		return threadsAnswer{}, err
+	}
+	return threadsFrom(g), nil
 }
 
 // diffFrom is one file's diff, from the PR's REST files: its patch parsed
@@ -467,7 +689,7 @@ func (c *ghClient) setViewed(ctx context.Context, r repoRef, number int, head, p
 	if viewed {
 		mutation = "markFileAsViewed"
 	}
-	return c.graphql(ctx, `mutation($id: ID!, $path: String!) {
+	return c.mutate(ctx, `mutation($id: ID!, $path: String!) {
   `+mutation+`(input: {pullRequestId: $id, path: $path}) { clientMutationId }
-}`, map[string]any{"id": id, "path": path}, nil)
+}`, map[string]any{"id": id, "path": path}, mutation, nil)
 }

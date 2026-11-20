@@ -27,7 +27,7 @@ import (
 
 // appVersion is this build's version, as herdr-plugin.toml has it (a test
 // holds them together): the mod checks it's the one it pinned.
-const appVersion = "0.11.0-joshvera.1"
+const appVersion = "0.11.0-joshvera.2"
 
 // appRequest is what the mod asks.
 type appRequest struct {
@@ -37,16 +37,31 @@ type appRequest struct {
 	Repo   string `json:"repo,omitempty"`   // list's repo tab: host/owner/name
 	Cursor string `json:"cursor,omitempty"` // list, repos: where to go on from
 	PR     *prID  `json:"pr,omitempty"`
-	Do     string `json:"do,omitempty"`     // act: draft, ready, merge, auto, auto-off, enqueue, dequeue, delete-branch
+	// act: draft, ready, merge, auto, auto-off, enqueue, dequeue, delete-branch,
+	// viewed, unviewed; and the review actions (review.go): comment, reply,
+	// resolve, unresolve, edit, delete, submit, discard.
+	Do     string `json:"do,omitempty"`
 	Method string `json:"method,omitempty"` // act merge, auto: MERGE, SQUASH, REBASE
 	// worktree: folders to look in for a checkout of the PR's repo (the
 	// machine's spaces), and whether to clone it when there's none.
 	Dirs  []string `json:"dirs,omitempty"`
 	Clone bool     `json:"clone,omitempty"`
-	Path  string   `json:"path,omitempty"` // unworktree: the worktree to remove; diff, act viewed: the file
-	Head  string   `json:"head,omitempty"` // diff, act viewed: the PR's head commit the mod was shown
-	BG    bool     `json:"bg,omitempty"`   // run it as a job
-	Job   string   `json:"job,omitempty"`  // job: which; on a job's own run, where its answer goes
+	Path  string   `json:"path,omitempty"` // unworktree: the worktree to remove; diff, act viewed, comment: the file
+	Head  string   `json:"head,omitempty"` // diff, act viewed, comment: the PR's head commit the mod was shown
+	// The review actions: a comment's line and side (left or right), the
+	// text as typed, the thread or comment acted on, and for submit and
+	// discard the pending review and its comment count as the dialog showed
+	// them, and the event (comment, approve, request_changes).
+	Line     int    `json:"line,omitempty"`
+	Side     string `json:"side,omitempty"`
+	Body     string `json:"body,omitempty"`
+	Thread   string `json:"thread,omitempty"`
+	Comment  string `json:"comment,omitempty"`
+	ReviewID string `json:"reviewId,omitempty"`
+	Event    string `json:"event,omitempty"`
+	Count    *int   `json:"count,omitempty"`
+	BG       bool   `json:"bg,omitempty"`  // run it as a job
+	Job      string `json:"job,omitempty"` // job: which; on a job's own run, where its answer goes
 }
 
 // prID names a pull request: host, owner/name and number.
@@ -267,13 +282,37 @@ func appError(err error) map[string]any {
 	case errors.As(err, &nc):
 		e["noCheckout"] = map[string]string{"repo": nc.Repo.String(), "dest": nc.Dest}
 	}
+	var a *actError
+	if errors.As(err, &a) {
+		if a.unknown {
+			e["unknown"] = true
+		}
+		if a.hasReview {
+			e["review"] = a.review // null when there's none
+		}
+		if a.changed {
+			e["changed"] = true
+		}
+	}
 	return e
 }
 
 func appAnswer(ctx context.Context, cfg config, req appRequest) (any, error) {
+	if req.Op == "act" {
+		// Every act is a mutation: the whole of it, reads and all, is bounded,
+		// so the mod (which waits longer) always gets an answer.
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, mutationDeadline)
+		defer cancel()
+	}
 	var demo *appDemo
 	var src source
 	if req.Demo {
+		unlock, err := lockAppDemo()
+		if err != nil {
+			return nil, err
+		}
+		defer unlock()
 		demo = loadAppDemo()
 		src = demo.src
 	} else {
@@ -347,6 +386,17 @@ func appAnswer(ctx context.Context, cfg config, req appRequest) (any, error) {
 	if out, ok, err := appFilesOp(ctx, src, demo, req, r); ok {
 		return out, err
 	}
+	// The review actions too: each reads what it needs itself. The demo's
+	// state is saved when the action changed it, whatever the outcome (an
+	// unknown one may have; a reply's first step may have).
+	if out, ok, err := appReviewOp(ctx, src, req, r); ok {
+		if demo != nil && demo.src.changed {
+			if serr := demo.save(); serr != nil && err == nil {
+				return nil, serr
+			}
+		}
+		return out, err
+	}
 	pr, err := src.byNumber(ctx, r, req.PR.Number)
 	if err != nil {
 		return nil, err
@@ -383,7 +433,7 @@ func appAnswer(ctx context.Context, cfg config, req appRequest) (any, error) {
 }
 
 // appFilesOp answers the ops of the Files changed view, and says whether the
-// request was one: files, diff, and act viewed or unviewed. A diff for a head
+// request was one: files, threads, diff, and act viewed or unviewed. A diff for a head
 // that's in the cache answers from it before anything asks GitHub anything
 // (never for the demo, which has no cache and no network).
 func appFilesOp(ctx context.Context, src source, demo *appDemo, req appRequest, r repoRef) (any, bool, error) {
@@ -391,6 +441,12 @@ func appFilesOp(ctx context.Context, src source, demo *appDemo, req appRequest, 
 	switch {
 	case req.Op == "files":
 		out, err := src.files(ctx, r, n)
+		return out, true, err
+	case req.Op == "threads":
+		out, err := src.threads(ctx, r, n)
+		if err == nil && demo != nil && demo.src.changed {
+			err = demo.save() // the demo's pending review grows as it's polled
+		}
 		return out, true, err
 	case req.Op == "diff":
 		if err := checkHeadAndPath(req); err != nil {
@@ -704,9 +760,34 @@ type demoChange struct {
 	Tree  bool        `json:"tree"`
 	// Which files of the PR are viewed, by path; absent in older saves.
 	Viewed map[string]string `json:"viewed,omitempty"`
+	// Its review threads and the viewer's pending review; absent in older saves.
+	Review *demoReviewSave `json:"review,omitempty"`
 }
 
 func appDemoPath() string { return filepath.Join(stateDir(), "app-demo.json") }
+
+// lockAppDemo takes the demo's lock file for one request, from its load to
+// its save: each request is its own process, and the mod's polls overlap its
+// changes, so a poll saving the review's growth over a mark saved meanwhile
+// (or the other way round) would lose it. The demo asks nothing of the
+// network, so the wait is short.
+func lockAppDemo() (unlock func(), err error) {
+	if err := os.MkdirAll(stateDir(), 0o700); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(filepath.Join(stateDir(), "app-demo.lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	return func() {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		_ = f.Close()
+	}, nil
+}
 
 func loadAppDemo() *appDemo {
 	d := &appDemo{src: newDemoSource()}
@@ -733,6 +814,9 @@ func loadAppDemo() *appDemo {
 				d.src.viewed[p.key()][path] = state
 			}
 		}
+		if data := d.src.filesData[p.key()]; data != nil && c.Review != nil {
+			data.loadReview(c.Review)
+		}
 	}
 	return d
 }
@@ -744,6 +828,9 @@ func (d *appDemo) save() error {
 		if p.AutoMergeRequest != nil {
 			c.Auto = p.AutoMergeRequest.MergeMethod
 		}
+		if data := d.src.filesData[p.key()]; data != nil {
+			c.Review = data.saveReview()
+		}
 		saved[p.key()] = c
 	}
 	data, err := json.Marshal(saved)
@@ -753,7 +840,20 @@ func (d *appDemo) save() error {
 	if err := os.MkdirAll(stateDir(), 0o700); err != nil {
 		return err
 	}
-	return os.WriteFile(appDemoPath(), data, 0o600)
+	// Whole or not at all: written beside it, then renamed over it.
+	tmp, err := os.CreateTemp(stateDir(), "app-demo-*.json")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name()) // gone once renamed; else the leftover
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), appDemoPath())
 }
 
 // ── jobs ──────────────────────────────────────────────────────────────────────

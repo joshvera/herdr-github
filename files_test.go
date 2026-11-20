@@ -27,6 +27,16 @@ type fakePR struct {
 	queries []gqlRequest
 	headQs  int
 	errors  []map[string]any // sent with the data (a partial answer)
+	// What the first page says of the PR and its reviews.
+	mine      bool
+	reviews   []map[string]any
+	submitted []map[string]any // what reviews(last: 10) says
+	// Both review reads come back null (GitHub's errors say why), as in a
+	// partial answer.
+	reviewsNull bool
+	// When set, what the pending-reviews read says, as it is (a null node,
+	// say).
+	reviewsRaw any
 }
 
 func (p *fakePR) handler() http.HandlerFunc {
@@ -58,6 +68,17 @@ func (p *fakePR) handler() http.HandlerFunc {
 			return map[string]any{
 				"pageInfo": map[string]any{"hasNextPage": end < len(all), "endCursor": "p" + strconv.Itoa(end)},
 				"nodes":    all[off:end],
+			}
+		}
+		if req.Variables["review"] == true {
+			pr["viewerDidAuthor"], pr["state"] = p.mine, "OPEN"
+			pr["reviews"] = map[string]any{"nodes": append([]map[string]any{}, p.reviews...)}
+			pr["submitted"] = map[string]any{"nodes": append([]map[string]any{}, p.submitted...)}
+			if p.reviewsRaw != nil {
+				pr["reviews"] = p.reviewsRaw
+			}
+			if p.reviewsNull {
+				pr["reviews"], pr["submitted"] = nil, nil
 			}
 		}
 		if req.Variables["files"] == true {
@@ -405,5 +426,192 @@ func TestFilesPRThatIsntThere(t *testing.T) {
 	_, err := newClient("github.com").files(ctxBG(), testRepo, 7)
 	if err == nil || !strings.Contains(err.Error(), "o/r#7 isn't there") {
 		t.Fatalf("err %v", err)
+	}
+}
+
+// reviewNode is a review as GraphQL sends it.
+func reviewNode(id, state string, mine bool, comments int, commit string) map[string]any {
+	return map[string]any{"id": id, "body": "overall\nthoughts", "state": state, "viewerDidAuthor": mine,
+		"commit": map[string]any{"oid": commit}, "comments": map[string]any{"totalCount": comments}}
+}
+
+// `files` says whose PR it is, its state, the viewer's pending review and
+// what the viewer may do to each thread and comment.
+func TestFilesCarryTheReviewAndPermissions(t *testing.T) {
+	cacheFixture(t)
+	pr := &fakePR{t: t, head: staticHead(headA), mine: true}
+	pr.reviews = []map[string]any{
+		reviewNode("PRR_other", "PENDING", false, 9, headA), // someone else's: never the viewer's
+		reviewNode("PRR_mine", "PENDING", true, 3, headB),
+	}
+	for i := 0; i < 150; i++ {
+		pr.files = append(pr.files, fileNode(fmt.Sprintf("f%03d", i), "MODIFIED", "UNVIEWED", 1, 1))
+	}
+	c := commentNode("C1", "me", "mine", "PENDING")
+	c["viewerDidAuthor"], c["viewerCanUpdate"], c["viewerCanDelete"] = true, true, true
+	pr.threads = []map[string]any{threadNode("T", "f000", map[string]any{
+		"viewerCanReply": true, "viewerCanResolve": false, "viewerCanUnresolve": true,
+		"comments": map[string]any{"pageInfo": map[string]any{"hasNextPage": false}, "nodes": []any{c, commentNode("C2", "you", "theirs", "SUBMITTED")}},
+	})}
+	fakeGitHubREST(t, pr.handler(), restFilesPages(t, nil, 100, headA, nil))
+	got, err := newClient("github.com").files(ctxBG(), testRepo, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := (prInfo{ID: "PR_x", Mine: true, State: "open"}); got.PR != want {
+		t.Fatalf("pr %+v", got.PR)
+	}
+	if want := (reviewInfo{ID: "PRR_mine", Body: "overall\nthoughts", Comments: 3, Commit: headB}); got.Review.Val == nil || *got.Review.Val != want {
+		t.Fatalf("review %+v", got.Review)
+	}
+	th := got.Threads[0]
+	if !th.CanReply || th.CanResolve || !th.CanUnresolve {
+		t.Fatalf("thread permissions %+v", th)
+	}
+	mine, theirs := th.Comments[0], th.Comments[1]
+	if !mine.Mine || !mine.CanEdit || !mine.CanDelete || theirs.Mine || theirs.CanEdit || theirs.CanDelete {
+		t.Fatalf("comment permissions %+v %+v", mine, theirs)
+	}
+	// The PR and its reviews are asked for on the first page only.
+	if len(pr.queries) != 2 || pr.queries[0].Variables["review"] != true || pr.queries[1].Variables["review"] != false {
+		t.Fatalf("%d queries, review %v", len(pr.queries), pr.queries[0].Variables["review"])
+	}
+}
+
+// No pending review of the viewer's: review is null, not left out.
+func TestFilesWithNoPendingReviewSaysNull(t *testing.T) {
+	cacheFixture(t)
+	pr := &fakePR{t: t, head: staticHead(headA)}
+	pr.reviews = []map[string]any{reviewNode("PRR_sent", "COMMENTED", true, 1, headA)}
+	fakeGitHubREST(t, pr.handler(), restFilesPages(t, nil, 100, headA, nil))
+	got := opRun(t, `{"op":"files",`+opPR+`}`)
+	if v, ok := got["review"]; !ok || v != nil {
+		t.Fatalf("review %v (present %v)", v, ok)
+	}
+	if p := got["pr"].(map[string]any); p["id"] != "PR_x" || p["mine"] != false || p["state"] != "open" {
+		t.Fatalf("pr %v", p)
+	}
+}
+
+// `threads`: the threads, the PR and the pending review, in one GraphQL
+// request, with no files, no REST and no detail query.
+func TestOpThreads(t *testing.T) {
+	cacheFixture(t)
+	pr := &fakePR{t: t, head: staticHead(headA)}
+	pr.reviews = []map[string]any{reviewNode("PRR_mine", "PENDING", true, 2, headA)}
+	pr.files = []map[string]any{fileNode("a.rb", "MODIFIED", "UNVIEWED", 1, 1)}
+	pr.threads = []map[string]any{
+		threadNode("T2", "b.rb", map[string]any{"line": 1, "startLine": 1}),
+		threadNode("T1", "a.rb", map[string]any{"line": 9, "startLine": 9}),
+	}
+	fakeGitHubREST(t, pr.handler(), nil) // any REST request fails the test
+	got := opRun(t, `{"op":"threads",`+opPR+`}`)
+	if _, ok := got["files"]; ok {
+		t.Fatalf("threads answered files: %v", got)
+	}
+	for _, k := range []string{"head", "pr", "review", "threads", "more"} {
+		if _, ok := got[k]; !ok {
+			t.Fatalf("no %s in %v", k, got)
+		}
+	}
+	typed := demoRunAs[threadsAnswer](t, `{"op":"threads",`+opPR+`}`)
+	if typed.Head != headA || typed.Review.Val == nil || typed.Review.Val.ID != "PRR_mine" || len(typed.Threads) != 2 || typed.Threads[0].ID != "T1" {
+		t.Fatalf("%+v", typed)
+	}
+	if len(pr.queries) != 2 || pr.headQs != 0 {
+		t.Fatalf("%d queries, %d head reads", len(pr.queries), pr.headQs)
+	}
+	for _, q := range pr.queries {
+		if q.Variables["files"] != false || strings.Contains(q.Query, "mergeStateStatus") {
+			t.Fatalf("asked for files or the detail: %v", q.Variables)
+		}
+	}
+}
+
+// submittedNode is a review as the `submitted` read sends it.
+func submittedNode(id, state string, mine bool, at any) map[string]any {
+	return map[string]any{"id": id, "state": state, "viewerDidAuthor": mine, "submittedAt": at}
+}
+
+// `threads` carries the viewer's latest submitted review (A6): not someone
+// else's, not the pending one, the latest by when it was submitted; null
+// when there's none. It's read on the first page, under its own alias.
+func TestThreadsCarryTheViewersLatestSubmittedReview(t *testing.T) {
+	cacheFixture(t)
+	pr := &fakePR{t: t, head: staticHead(headA)}
+	pr.submitted = []map[string]any{
+		submittedNode("PRR_late", "APPROVED", true, "2026-11-19T10:00:05Z"),
+		submittedNode("PRR_early", "COMMENTED", true, "2026-11-19T10:00:00Z"),
+		submittedNode("PRR_theirs", "CHANGES_REQUESTED", false, "2026-11-19T11:00:00Z"),
+		submittedNode("PRR_pending", "PENDING", true, nil),
+	}
+	fakeGitHubREST(t, pr.handler(), nil)
+	got := demoRunAs[threadsAnswer](t, `{"op":"threads",`+opPR+`}`)
+	want := submittedInfo{ID: "PRR_late", State: "approved", At: time.Date(2026, 11, 19, 10, 0, 5, 0, time.UTC).UnixMilli()}
+	if got.Submitted.Val == nil || *got.Submitted.Val != want {
+		t.Fatalf("submitted %+v", got.Submitted)
+	}
+	q := pr.queries[0].Query
+	if !strings.Contains(q, "submitted: reviews(last: 10) @include(if: $review) {") {
+		t.Fatalf("the submitted read isn't aliased, or its directive isn't before its braces:\n%s", q)
+	}
+
+	pr.submitted = []map[string]any{submittedNode("PRR_pending", "PENDING", true, nil), submittedNode("PRR_theirs", "COMMENTED", false, "2026-11-19T11:00:00Z")}
+	raw := opRun(t, `{"op":"threads",`+opPR+`}`)
+	if v, ok := raw["submitted"]; !ok || v != nil {
+		t.Fatalf("submitted %v (present %v)", v, ok)
+	}
+}
+
+// A partial answer whose review reads came back null says nothing of the
+// pending or submitted review: both keys are left out, so the mod keeps what
+// it had. A null would read as "no pending review", and so as "submitted".
+func TestThreadsLeaveOutReviewsAPartialAnswerDidntGive(t *testing.T) {
+	cacheFixture(t)
+	pr := &fakePR{t: t, head: staticHead(headA), reviewsNull: true}
+	pr.reviews = []map[string]any{reviewNode("PRR_mine", "PENDING", true, 3, headA)}
+	pr.errors = []map[string]any{{"type": "INTERNAL", "message": "reviews timed out", "path": []any{"repository", "pullRequest", "reviews"}}}
+	fakeGitHubREST(t, pr.handler(), nil)
+	// (`files` answers through the same threadsFrom.)
+	got := opRun(t, `{"op":"threads",`+opPR+`}`)
+	for _, k := range []string{"review", "submitted"} {
+		if v, ok := got[k]; ok {
+			t.Fatalf("%s is %v, but GitHub didn't say", k, v)
+		}
+	}
+	if got["more"] != true || got["head"] != headA {
+		t.Fatalf("%v", got)
+	}
+
+	// A null where a node or the nodes should be: GitHub failed under the
+	// review, which may be the pending one. Not known either.
+	pr.reviewsNull = false
+	for _, raw := range []any{map[string]any{"nodes": nil}, map[string]any{"nodes": []any{nil}}} {
+		pr.reviewsRaw = raw
+		if v, ok := opRun(t, `{"op":"threads",`+opPR+`}`)["review"]; ok {
+			t.Fatalf("%v: review is %v, but GitHub didn't say", raw, v)
+		}
+	}
+	pr.reviewsRaw = nil
+
+	// The pending review found, even with errors elsewhere: there's only
+	// one, so it's known. Not so the latest submitted review: a node that
+	// came back null may be a later one, so what was found isn't the
+	// latest, and an A6 check would read the true latest's first sighting
+	// as "submitted".
+	pr.submitted = []map[string]any{submittedNode("PRR_older", "COMMENTED", true, "2026-11-19T10:00:00Z")}
+	got = opRun(t, `{"op":"threads",`+opPR+`}`)
+	if rv, ok := got["review"].(map[string]any); !ok || rv["id"] != "PRR_mine" {
+		t.Fatalf("review %v", got["review"])
+	}
+	if v, ok := got["submitted"]; ok {
+		t.Fatalf("submitted is %v, but a partial answer can't say which is the latest", v)
+	}
+
+	// No errors: there, and null when there's none.
+	pr.errors, pr.submitted = nil, nil
+	got = opRun(t, `{"op":"threads",`+opPR+`}`)
+	if v, ok := got["submitted"]; !ok || v != nil {
+		t.Fatalf("submitted %v (present %v)", v, ok)
 	}
 }
