@@ -26,7 +26,7 @@ import { whoOf, sameWho, mergeWho, empty, seed, listPatch, resolveRepo, pickedRe
 
 // The herdr-github this mod is part of (its release; the repo's tests hold it
 // to herdr-plugin.toml's version).
-export const GITHUB_VERSION = "0.11.0-joshvera.1";
+export const GITHUB_VERSION = "0.11.0-joshvera.2";
 
 // Puts that release on a machine, once: from this fork's releases, into a
 // folder of the fork's own version (joshvera-<version>), so it never touches
@@ -1134,7 +1134,7 @@ export default class GitHub extends View {
       else if (r.kind === "refused") this.say(r.error, cx, true);
       // Not known whether it went: held, so the reads below, failing, can't
       // say over it.
-      else this.hold("No answer. Check the PR before trying again.", cx);
+      else this.hold(`No answer about #${pr.number}. Check that PR before trying again.`, cx);
       this.acting.delete(pr.key);
       this.busy = "";
       // What follows (a merge's cleanup) is about this PR: only while it's

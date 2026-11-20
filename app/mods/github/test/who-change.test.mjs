@@ -53,7 +53,7 @@ test("F1b: a who change on the PR screen says what was out before dropping it, h
 });
 
 test("F1b: a change from the Overview with no answer is held, so the failing reads after it can't say over it", () => {
-  assert.match(body(main, "act"), /this\.hold\("No answer\. Check the PR before trying again\.", cx\)/);
+  assert.match(body(main, "act"), /this\.hold\(`No answer about #\$\{pr\.number\}\. Check that PR before trying again\.`, cx\)/);
 });
 
 test("F1b: what's held goes only when the user leaves the screen it's on, never when toList or say run", () => {
