@@ -136,3 +136,37 @@ export function viewedAfter(kind, was, to) {
   // Unknown: it may be marked or not. Left as asked, and the line says so.
   return kind === "refused" ? was : to;
 }
+
+// Who changed while the Files tab had something out (main's settle drops the
+// view: its pending review, threads and checks are another account's). What
+// was sent, or being checked, is said not known before it goes, with where
+// to look first: the line it's said on is cut to fit. Drafts stay (they're
+// written as the view closes).
+//
+//   composer / dialog sending or checking ─► "your comment", "your review"…
+//   a check left (x, shift-d unknown) ─────► "a resolve", "a delete"
+//   another change out (x, shift-d, v) ────► "a change"
+//   none, but the composer or dialog open ─► the tab started over, text kept
+
+const COMPOSED = { comment: "your comment", reply: "your reply", edit: "your edit" };
+const OUT = new Set(["sending", "checking"]);
+
+/**
+ * @param {{ sending: boolean, composer: { phase: string, kind: string } | null,
+ *   dialog: { phase: string, kind: string } | null, checks: any[] }} s
+ * @returns {string} "" when there's nothing to say
+ */
+export function leaveNote({ sending, composer, dialog, checks }) {
+  const what = [];
+  if (composer && OUT.has(composer.phase)) what.push(COMPOSED[composer.kind] ?? "your comment");
+  if (dialog && OUT.has(dialog.phase)) what.push(dialog.kind === "discard" ? "the discard" : "your review");
+  for (const c of checks) what.push(c.kind === "resolve" ? (c.want ? "a resolve" : "an unresolve") : c.kind === "delete" ? "a delete" : "a change");
+  // Out with neither the composer's nor the dialog's: x, shift-d or v.
+  if (sending && composer?.phase !== "sending" && dialog?.phase !== "sending") what.push("a change");
+  if (what.length) {
+    const which = what.length === 1 ? what[0] : `${what.length} changes`;
+    return `Signed in as someone else now: check the PR on GitHub before sending again. Not known whether ${which} went through.`;
+  }
+  if (composer || dialog) return "Signed in as someone else now, so the Files tab started over. What you typed is kept as a draft.";
+  return "";
+}

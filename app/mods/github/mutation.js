@@ -5,6 +5,8 @@
 // first fails, which for a comment is a second comment. So a mutation has its
 // own path, and every way it can end is one of three outcomes:
 //
+//   who ──────── status fails, who changed ──────────► refused  (nothing ran)
+//      │
 //   prepare() ── throws ──────────────────────────────► refused  (nothing ran)
 //      │
 //   run(bin) ─── rejects, times out ─────────────────► unknown  (it may have run)
@@ -30,14 +32,23 @@ export const MUTATION_TIMEOUT = 45000;
 const said = (e) => String(e?.message ?? e);
 
 /**
+ * Who a change goes as (main's status search, seen from here). `made` is
+ * `gen()` when the change's request was built from what was on screen.
+ * @typedef {{ finding: () => Promise<unknown> | null, live: () => boolean,
+ *   find: () => Promise<unknown>, gen: () => number, made: number }} Who
+ */
+
+/**
  * Runs one mutation, once.
- * @param {{ prepare: () => Promise<string>, run: (bin: string) => Promise<{ stdout: string }> }} steps
- *   prepare: finds the binary (nothing is sent yet); run: execs it with the request.
+ * @param {{ who?: Who, prepare: () => Promise<string>, run: (bin: string) => Promise<{ stdout: string }> }} steps
+ *   who: settled first (settleWho; none in the demo); prepare: finds the
+ *   binary (nothing is sent yet); run: execs it with the request.
  * @returns {Promise<Outcome>}
  */
-export async function sendOnce({ prepare, run }) {
+export async function sendOnce({ who, prepare, run }) {
   let bin;
   try {
+    if (who) await settleWho(who);
     bin = await prepare();
   } catch (e) {
     return { kind: "refused", error: `Nothing was sent: ${said(e)}`, answer: null };
@@ -51,6 +62,22 @@ export async function sendOnce({ prepare, run }) {
     return { kind: "unknown", error: `No answer from herdr-github: ${said(e)}`, answer: null };
   }
   return classify(out?.stdout);
+}
+
+/**
+ * Before a change goes: who it goes as is the one status said this opening,
+ * not the cache's, and still the one it was made under. A status search
+ * already out is waited for (it may be about to say someone else); with no
+ * who said yet, status is asked now. `gen` moves whenever who changes (main's
+ * forget), so a change made before that is from another account's screen
+ * (its pending review, its "mine") and goes nowhere. Throws why not.
+ * @param {Who} who
+ */
+export async function settleWho({ finding, live, find, gen, made }) {
+  // Until none is out: one that ends may have started another.
+  for (let out = finding(), last = null; out && out !== last; last = out, out = finding()) await out;
+  if (!live()) await find();
+  if (gen() !== made) throw new Error("the GitHub account changed since this was made");
 }
 
 /**

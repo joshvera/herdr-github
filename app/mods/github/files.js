@@ -33,7 +33,7 @@ import { diffItems } from "./diffitems.js";
 import { TREE_ROW_H, treeRow, viewedMark, diffItem } from "./filesdraw.js";
 import { applyPoll, countThreads, refind, shiftedAbove, PollHealth, HOLD_MS, reviewsOf } from "./follow.js";
 import { route, reviewAction, deletePrompt, latestMine, mayMoveKeyboard, NEW_COMMITS, OLDER_COMMIT } from "./reviewkeys.js";
-import { withResolved, withComment, withReply, withEdit, withoutComment, withoutPending, answerChecks, viewedAfter, CHECK_MS } from "./sent.js";
+import { withResolved, withComment, withReply, withEdit, withoutComment, withoutPending, answerChecks, viewedAfter, leaveNote, CHECK_MS } from "./sent.js";
 import { DraftStore, DRAFTS_KEY, DEMO_DRAFTS_KEY, SAVE_MS, draftId, makeDraft, rowOf, rowTarget, placeDrafts, unplaced, droppedNote } from "./drafts.js";
 import { SubmitDialog, CHOICES, DIALOG_NOTES } from "./dialog.js";
 import { Composer, CHECK_POLL_MS, NOTES, idsOn, request, purpose, typedSince } from "./compose.js";
@@ -81,6 +81,10 @@ export class FilesView {
     this.app = app;
     this.ui = ui;
     this.pr = app.cur;
+    // Who it's read as (main's gen, which moves when who changes): every
+    // change it sends was made under this, and once it moves the view is
+    // dead (main's settle makes another).
+    this.made = app.gen;
     this.state = "idle"; // idle, loading, ok, error, old
     this.error = "";
     this.data = null; // `files`'s answer: head, files, threads, more (the threads'), filesMore
@@ -135,11 +139,12 @@ export class FilesView {
     ui.treeScroll.scroll_to_item(0);
   }
 
-  // Whether it's still the tab's view (a PR opened since replaces it). An
-  // answer for a view that isn't touches nothing: not its state, not the
-  // lists' handles (they're the new view's now), and it asks nothing more.
+  // Whether it's still the tab's view (a PR opened since, or who changing,
+  // replaces it). An answer for a view that isn't touches nothing: not its
+  // state, not the lists' handles (they're the new view's now), and it asks
+  // nothing more. Dead as soon as who changes, before main's settle runs.
   alive() {
-    return this.app.files === this;
+    return this.app.files === this && this.app.gen === this.made;
   }
 
   // A text box has the keyboard: the filter, or the composer. main's keyDown
@@ -245,9 +250,17 @@ export class FilesView {
 
   // ── fetching ───────────────────────────────────────────────────────────
 
+  // Every read this tab makes. Only one a person asked for (`user`: the tab
+  // shown, r) may look for GitHub again when it fails; any other (a poll, a
+  // read owed after a change, a diff) just fails (reads.js), so a dropped
+  // exec can't change who and start everything over.
+  read(req, opts = {}, user = false) {
+    return this.app.gh(req, { ...opts, auto: !user });
+  }
+
   // The tab came into view: its files, the first time.
   shown(cx) {
-    if (this.state === "idle") this.loadFiles(cx);
+    if (this.state === "idle") this.loadFiles(cx, "", true);
     else {
       this.pump(cx);
       this.poll(cx);
@@ -259,16 +272,16 @@ export class FilesView {
     this.failed.clear();
     if (this.path) this.diffs.delete(this.path);
     if (this.state === "old" || this.state === "error") this.state = "idle";
-    this.loadFiles(cx);
+    this.loadFiles(cx, "", true);
   }
 
   // One `files` at a time: it's every REST page of the PR. Asked again
   // while one is out (r, a stale answer), it's read once more when that one
-  // answers, however many times it was asked.
-  loadFiles(cx, note = "") {
+  // answers, however many times it was asked. `user`: a person asked (read).
+  loadFiles(cx, note = "", user = false) {
     if (!this.alive()) return;
     if (this.reading) {
-      this.again = { note: note || this.again?.note || "" };
+      this.again = { note: note || this.again?.note || "", user: user || Boolean(this.again?.user) };
       return;
     }
     this.reading = true;
@@ -278,14 +291,14 @@ export class FilesView {
     cx.spawn(async (cx) => {
       let res;
       try {
-        res = await this.app.gh({ op: "files", pr: this.prID() }, SLOW);
+        res = await this.read({ op: "files", pr: this.prID() }, SLOW, user);
       } catch (e) {
         if (!this.alive()) return;
         this.reading = false;
         const again = this.again;
         this.again = null;
         if (TOO_OLD.test(said(e))) this.state = "old";
-        else if (again) this.loadFiles(cx, again.note);
+        else if (again) this.loadFiles(cx, again.note, again.user);
         else if (this.data) {
           // What was there stays, and the open diff r let go comes again.
           this.say(said(e), cx, true);
@@ -336,7 +349,7 @@ export class FilesView {
       // What was asked for meanwhile goes now; its diffs wait for it (pump).
       const again = this.again;
       this.again = null;
-      if (again) this.loadFiles(cx, again.note);
+      if (again) this.loadFiles(cx, again.note, again.user);
       this.pump(cx);
       cx.notify();
     });
@@ -360,7 +373,7 @@ export class FilesView {
       let res = null;
       let err = null;
       try {
-        res = await this.app.gh({ op: "diff", pr: this.prID(), path, head }, SLOW);
+        res = await this.read({ op: "diff", pr: this.prID(), path, head }, SLOW);
       } catch (e) {
         err = e;
       }
@@ -448,7 +461,7 @@ export class FilesView {
       let res = null;
       let err = null;
       try {
-        res = await this.app.gh({ op: "threads", pr: this.prID() });
+        res = await this.read({ op: "threads", pr: this.prID() });
       } catch (e) {
         err = e;
       }
@@ -525,7 +538,7 @@ export class FilesView {
     this.sending = true;
     cx.spawn(async (cx) => {
       if (before) await before();
-      const r = await this.app.mutate({ ...req, pr: this.prID() });
+      const r = await this.app.mutate({ ...req, pr: this.prID() }, this.made);
       this.sending = false;
       done(r, cx);
       cx.notify();
@@ -1034,6 +1047,27 @@ export class FilesView {
       return Boolean(t) && m.rows.has(draftId(t));
     }
     return it.kind === "thread" && m.threads.has(it.t.id);
+  }
+
+  // Who changed (main's settle): what this view holds (the pending review,
+  // "mine", what's held and checked) is another account's, and goes with
+  // it. What was out is said not known first (sent.js leaveNote), what's
+  // typed is written, and nothing here can take the keyboard when an answer
+  // for it comes later. What to say, or "".
+  leave() {
+    const note = leaveNote({
+      sending: this.sending,
+      composer: this.composer && { phase: this.composer.phase, kind: this.composer.target.kind },
+      dialog: this.dialog && { phase: this.dialog.phase, kind: this.dialog.sent?.kind ?? "" },
+      checks: this.checks,
+    });
+    this.close();
+    this.composer = null;
+    this.dialog = null;
+    this.confirm = null;
+    this.checks = [];
+    this.writing = this.bodyWriting = this.filtering = false;
+    return note;
   }
 
   // The popup is closing: what's typed is written now.

@@ -106,3 +106,97 @@ test("a poll that started after the mutation ended is used", () => {
   const stamp = g.startPoll();
   assert.equal(g.fresh(stamp), true);
 });
+
+// Who a change goes as (sendOnce's `who`): a fake of main's status search.
+// `live`: status has said who this opening; `gen`: moves when who changes.
+function account({ live = true, gen = 0, finding = null, find = async () => {} } = {}) {
+  const a = { live, gen, finding, finds: 0 };
+  a.who = {
+    finding: () => a.finding,
+    live: () => a.live,
+    find: async () => {
+      a.finds++;
+      await find(a);
+      a.live = true;
+    },
+    gen: () => a.gen,
+    made: gen,
+  };
+  return a;
+}
+const okRun = () => counted(() => ({ stdout: '{"ok":true}' }));
+
+test("who only from the cache: status is asked before anything is sent", async () => {
+  const a = account({ live: false });
+  const run = okRun();
+  const r = await sendOnce({ who: a.who, prepare: async () => "/bin/hg", run });
+  assert.equal(a.finds, 1, "status asked first");
+  assert.equal(r.kind, "ok");
+  assert.equal(run.calls, 1);
+});
+
+test("a status search already out is waited for, and not asked again", async () => {
+  const a = account({ live: false });
+  let done;
+  a.finding = new Promise((resolve) => (done = resolve)).then(() => {
+    a.live = true;
+    a.finding = null;
+  });
+  const run = okRun();
+  const sending = sendOnce({ who: a.who, prepare: async () => "/bin/hg", run });
+  await new Promise((r) => setTimeout(r, 5));
+  assert.equal(run.calls, 0, "nothing sent while status is out");
+  done();
+  const r = await sending;
+  assert.equal(r.kind, "ok");
+  assert.equal(a.finds, 0, "the search out was enough");
+  assert.equal(run.calls, 1);
+});
+
+test("status failing refuses: nothing was sent, and nothing runs", async () => {
+  const a = account({ live: false, find: async () => { throw new Error("no machine answered"); } });
+  const run = okRun();
+  const r = await sendOnce({ who: a.who, prepare: async () => "/bin/hg", run });
+  assert.equal(r.kind, "refused");
+  assert.match(r.error, /^Nothing was sent: .*no machine answered/);
+  assert.equal(run.calls, 0);
+});
+
+test("a status search out that fails refuses too", async () => {
+  const a = account({ live: false });
+  a.finding = Promise.reject(new Error("gh isn't signed in"));
+  a.finding.catch(() => {});
+  const run = okRun();
+  const r = await sendOnce({ who: a.who, prepare: async () => "/bin/hg", run });
+  assert.equal(r.kind, "refused");
+  assert.match(r.error, /^Nothing was sent: /);
+  assert.equal(run.calls, 0);
+});
+
+test("made under one who, sent as another: refused, nothing runs", async () => {
+  // Status, while the change waited on it, found someone else signed in.
+  const a = account({ live: false, find: async (a) => void a.gen++ });
+  const run = okRun();
+  const r = await sendOnce({ who: a.who, prepare: async () => "/bin/hg", run });
+  assert.equal(r.kind, "refused");
+  assert.match(r.error, /^Nothing was sent: /);
+  assert.equal(run.calls, 0);
+});
+
+test("a change made before who changed is refused even when status needn't be asked", async () => {
+  const a = account({ live: true });
+  a.gen++;
+  const run = okRun();
+  const r = await sendOnce({ who: a.who, prepare: async () => "/bin/hg", run });
+  assert.equal(r.kind, "refused");
+  assert.equal(run.calls, 0);
+});
+
+test("confirmed and unchanged: sent once, status not asked", async () => {
+  const a = account({ live: true });
+  const run = okRun();
+  const r = await sendOnce({ who: a.who, prepare: async () => "/bin/hg", run });
+  assert.equal(r.kind, "ok");
+  assert.equal(a.finds, 0);
+  assert.equal(run.calls, 1);
+});

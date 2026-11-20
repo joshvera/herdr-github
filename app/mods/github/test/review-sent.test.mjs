@@ -1,7 +1,7 @@
 // What a change sent from the Files tab does to the threads shown (sent.js).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { withResolved, withComment, withReply, withEdit, withoutComment, withoutPending, checked, answerChecks, viewedAfter } from "../sent.js";
+import { withResolved, withComment, withReply, withEdit, withoutComment, withoutPending, checked, answerChecks, viewedAfter, leaveNote } from "../sent.js";
 
 const comment = (id, extra = {}) => ({ id, author: "sam", body: "hi", created: 1, state: "submitted", url: "", mine: false, canEdit: false, canDelete: false, ...extra });
 const thread = (id, comments, extra = {}) => ({
@@ -99,4 +99,25 @@ test("an unknown viewed mark stays as asked; only a refusal puts it back", () =>
   assert.equal(viewedAfter("ok", "unviewed", "viewed"), "viewed");
   assert.equal(viewedAfter("refused", "unviewed", "viewed"), "unviewed");
   assert.equal(viewedAfter("unknown", "unviewed", "viewed"), "viewed", "a guess either way; as asked, with the No answer line");
+});
+
+test("who changing under the Files tab: what was out is said not known, where to look first", () => {
+  const quiet = { sending: false, composer: null, dialog: null, checks: [] };
+  assert.equal(leaveNote(quiet), "", "nothing out, nothing open: nothing to say");
+  const one = leaveNote({ ...quiet, sending: true, composer: { phase: "sending", kind: "reply" } });
+  assert.match(one, /^Signed in as someone else now: check the PR on GitHub/);
+  assert.match(one, /Not known whether your reply went through/);
+  assert.match(leaveNote({ ...quiet, dialog: { phase: "checking", kind: "submit" } }), /whether your review went/);
+  assert.match(leaveNote({ ...quiet, sending: true }), /whether a change went/, "x, shift-d or v out");
+  assert.match(leaveNote({ ...quiet, checks: [{ kind: "resolve", want: true, thread: "T" }] }), /whether a resolve went/);
+  assert.match(
+    leaveNote({ sending: true, composer: { phase: "checking", kind: "comment" }, dialog: null, checks: [{ kind: "delete", comment: "C" }] }),
+    /whether 3 changes went/,
+  );
+});
+
+test("who changing under an open composer or dialog with nothing out says the tab started over, text kept", () => {
+  const quiet = { sending: false, composer: null, dialog: null, checks: [] };
+  assert.match(leaveNote({ ...quiet, composer: { phase: "editing", kind: "comment" } }), /started over\. What you typed is kept/);
+  assert.match(leaveNote({ ...quiet, dialog: { phase: "choose", kind: "" } }), /started over/);
 });

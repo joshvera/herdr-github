@@ -19,6 +19,7 @@ import { PR_TABS, tabFor, prRoute } from "./prkeys.js";
 import { FilesView } from "./files.js";
 import { sendOnce, MutationGate, MUTATION_TIMEOUT } from "./mutation.js";
 import { reviewChip } from "./follow.js";
+import { askSignedIn } from "./reads.js";
 import { Store } from "./store.js";
 import { whoOf, sameWho, mergeWho, empty, seed, listPatch, resolveRepo, pickedRepo, staleMark, stamper, takesOver, canAct } from "./cache.js";
 
@@ -240,6 +241,7 @@ export default class GitHub extends View {
     this.files = null; // the Files changed tab's view (files.js), one per PR opened
     this.flash = "";
     this.err = "";
+    this.statusErr = ""; // the last status error said (statusFailed): only it is cleared or replaced by status
     this.busy = "";
     this.acting = new Set(); // the PRs (keys) a change was sent for, until GitHub answers
     this.gate = new MutationGate(); // changes out, against which polls are ordered
@@ -327,7 +329,9 @@ export default class GitHub extends View {
       cx.spawn(async (cx) => {
         try {
           await this.findGitHub();
-          this.err = "";
+          // Only the status error goes: not what the Files tab said meanwhile.
+          if (this.err === this.statusErr) this.err = "";
+          this.statusErr = "";
           this.loadMissing(cx);
         } catch (e) {
           this.statusFailed(e);
@@ -441,14 +445,37 @@ export default class GitHub extends View {
 
   // After forget() (which may run where there's no cx, inside a status
   // search): a PR opened from a list that's gone goes back to the list; one
-  // opened straight (Recap, Linear) asks for its detail again; the lists
-  // load. Every 200 ms, at no cost when nothing was forgotten.
+  // opened straight (Recap, Linear) gets a fresh Files tab and asks for its
+  // detail again; the lists load. Every 200 ms, at no cost when nothing was
+  // forgotten.
+  //
+  // The Files tab's state (its pending review, "mine", the dialog) is the
+  // other account's, and a change made from it must not go as the new one
+  // (mutate refuses it too). What it had out is said not known before it
+  // goes, and said last, so it's on the screen the user lands on.
   settle(cx) {
     if (this.settledGen === this.gen) return;
     this.settledGen = this.gen;
     if (this.screen === "pr" && this.cur) {
-      if (!this.direct) this.toList(cx);
-      else if (!this.detail) this.loadDetail(cx);
+      const was = this.err;
+      const note = this.files?.leave() ?? "";
+      if (!this.direct) {
+        this.files = null;
+        this.toList(cx);
+      } else {
+        this.files = new FilesView(this, this.filesUI);
+        if (this.prTab === "files") this.files.loadFiles(cx);
+        // A live detail is the other account's as much as a cached one
+        // (forgetDetail's): gone, so nothing acts on it until the new one.
+        this.detail = null;
+        this.detailInfo = null;
+        this.menu = this.parked = null;
+        this.loadDetail(cx);
+        this.keys.focus();
+      }
+      if (note) this.say(note, cx, true);
+      // toList cleared it: status's "Not signed in" still stands.
+      else if (was && was === this.statusErr) this.err = was;
     }
     this.loadMissing(cx);
     cx.notify();
@@ -457,48 +484,58 @@ export default class GitHub extends View {
   // Status found no one signed in: said, and the cache's rows go if their
   // account signed out. (A machine that didn't answer isn't a sign-out:
   // what's shown stays, marked.)
+  //
+  // Said only over nothing or its own last word, never over another error
+  // (a Files tab change said not known): the 60 s re-ask would replace it.
   statusFailed(e) {
-    if (e instanceof DevError) {
-      this.err = e.message;
-      return;
-    }
-    this.err = `Not signed in to GitHub on any machine: ${e?.message ?? e}. Run gh auth login on one.`;
-    if (e?.cachedSignedOut) this.forget();
+    const said = e instanceof DevError ? e.message : `Not signed in to GitHub on any machine: ${e?.message ?? e}. Run gh auth login on one.`;
+    if (!this.err || this.err === this.statusErr) this.err = said;
+    this.statusErr = said;
+    if (!(e instanceof DevError) && e?.cachedSignedOut) this.forget();
   }
 
-  // One request where gh is signed in; `opts` go to exec (see ask).
-  /** @param {{ timeout?: number }} [opts] */
+  // One request where gh is signed in; `opts` go to exec (see ask), but
+  // `auto`: nobody asked for it (a poll), so a failure doesn't look for
+  // GitHub again (reads.js).
+  /** @param {{ timeout?: number, auto?: boolean }} [opts] */
   async gh(req, opts = {}) {
-    if (this.demo) return ask({ ...req, demo: true }, null, opts);
-    if (this.on == null || !this.login) await this.findGitHub();
-    try {
-      return await ask(req, this.on || null, opts);
-    } catch (e) {
-      if (e instanceof AppError || e instanceof TimedOut || e instanceof DevError) throw e;
-      // The machine went away, or herdr-github couldn't be fetched there: look again.
-      await this.findGitHub();
-      return ask(req, this.on || null, opts);
-    }
+    const { auto = false, ...execOpts } = opts;
+    if (this.demo) return ask({ ...req, demo: true }, null, execOpts);
+    return askSignedIn({
+      ask: () => ask(req, this.on || null, execOpts),
+      find: () => this.findGitHub(),
+      chosen: () => this.on != null && Boolean(this.login),
+      // The machine went away, or herdr-github couldn't be fetched there:
+      // look again. Not for GitHub's answer, a slow one, or a dev build's.
+      settled: (e) => e instanceof AppError || e instanceof TimedOut || e instanceof DevError,
+      auto,
+    });
   }
 
   // A change to GitHub, sent once (mutation.js): never asked again, here or
-  // on another machine. The machine is looked for first, only when none is
-  // chosen yet. Polls wait on this.gate while one is out.
-  /** @returns {Promise<import("./mutation.js").Outcome>} */
-  async mutate(req) {
-    if (!this.demo && (this.on == null || !this.login)) {
-      try {
-        await this.findGitHub();
-      } catch (e) {
-        return { kind: "refused", error: `Nothing was sent: ${e?.message ?? e}`, answer: null };
-      }
-    }
-    const machine = this.demo ? null : this.on || null;
+  // on another machine. First, who it goes as is settled (mutation.js
+  // settleWho): status this opening, not the cache's, waited for when a
+  // search is out, and still the who it was `made` under (this.gen when the
+  // action started), else nothing is sent. Polls wait on this.gate while one
+  // is out.
+  /**
+   * @param {number} made
+   * @returns {Promise<import("./mutation.js").Outcome>}
+   */
+  async mutate(req, made) {
+    let machine = null;
     const body = JSON.stringify(this.demo ? { ...req, demo: true } : req);
     this.gate.begin();
     try {
       return await sendOnce({
-        prepare: () => binary(machine),
+        who: this.demo ? undefined : {
+          finding: () => this.finding ?? null,
+          live: () => Boolean(this.who) && this.on != null && Boolean(this.login),
+          find: () => this.findGitHub(),
+          gen: () => this.gen,
+          made,
+        },
+        prepare: () => binary((machine = this.demo ? null : this.on || null)),
         run: (bin) => exec("sh", ["-c", 'exec "$0" app "$1"', bin, body], { timeout: MUTATION_TIMEOUT, on: machine }),
       });
     } finally {
@@ -1024,12 +1061,13 @@ export default class GitHub extends View {
     if (!this.mayAct(cx)) return;
     const pr = this.cur;
     if (this.acting.has(pr.key)) return this.say(`#${pr.number} is still changing: one change at a time.`, cx);
+    const made = this.gen;
     this.acting.add(pr.key);
     this.busy = label;
     this.menu = null;
     cx.notify();
     cx.spawn(async (cx) => {
-      const r = await this.mutate({ op: "act", ...what, pr: prID(pr) });
+      const r = await this.mutate({ op: "act", ...what, pr: prID(pr) }, made);
       const ok = r.kind === "ok";
       if (ok) this.say(r.answer.note ?? "Done", cx);
       else if (r.kind === "refused") this.say(r.error, cx, true);
@@ -1077,6 +1115,7 @@ export default class GitHub extends View {
     const tree = this.treeOf(pr);
     const canDelete = d?.cleanup?.deleteBranch;
     if (!d || (!canDelete && !tree)) return;
+    const made = this.gen;
     const clean = (branch, wt) => (cx) => {
       this.busy = "Cleaning up…";
       cx.notify();
@@ -1084,7 +1123,7 @@ export default class GitHub extends View {
         const done = [];
         const failed = [];
         if (branch) {
-          const r = await this.mutate({ op: "act", do: "delete-branch", pr: prID(pr) });
+          const r = await this.mutate({ op: "act", do: "delete-branch", pr: prID(pr) }, made);
           if (r.kind === "ok") done.push("branch deleted");
           else if (r.kind === "refused") failed.push(`branch not deleted: ${r.error}`);
           else failed.push("no answer about the branch: check the PR before trying again");
@@ -1655,6 +1694,9 @@ export default class GitHub extends View {
     const d = this.detail;
     const info = this.detailInfo;
     const mark = staleMark(Boolean(info?.cached), info?.at, info?.error ?? "");
+    // The mark is about the Overview's cache: shown with it, and cut short
+    // (an error can be long) so the review chip stays whole.
+    const shownMark = this.prTab === "overview" ? mark : "";
     const look = prLook(o, pr);
     const stateWord = pr.state === "MERGED" ? "Merged" : pr.state === "CLOSED" ? "Closed" : pr.draft ? "Draft" : pr.state ? "Open" : "";
     const now = Date.now();
@@ -1675,7 +1717,7 @@ export default class GitHub extends View {
           .child(div().text_size(12.5).text_color(o.dim).child(pr.repo))
           .child(div().flex_1())
           .when(Boolean(chipText), (el) => el.child(chip(o, "review", [icon("pr", o.work, 12), chipText], { color: o.work })))
-          .when(Boolean(mark), (el) => el.child(div().flex_none().text_size(12).text_color(info?.error ? o.fix : o.dim).child(mark)))
+          .when(Boolean(shownMark), (el) => el.child(div().min_w(0).truncate().text_size(12).text_color(info?.error ? o.fix : o.dim).child(shownMark)))
           .when(Boolean(pr.updated) && !mark, (el) => el.child(div().text_size(12).text_color(o.dim).child(`updated ${ago(pr.updated, now)}`))),
       )
       .child(div().flex_none().text_size(17).font_semibold().text_color(o.fg).line_height(1.35).child(pr.title))
