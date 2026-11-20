@@ -1,7 +1,7 @@
 // What a change sent from the Files tab does to the threads shown (sent.js).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { withResolved, withComment, withReply, withEdit, withoutComment, withoutPending, checked, answerChecks, viewedAfter, leaveNote } from "../sent.js";
+import { withResolved, withComment, withReply, withEdit, withoutComment, withoutPending, checked, answerChecks, viewedAfter, leaveNote, noteLines } from "../sent.js";
 
 const comment = (id, extra = {}) => ({ id, author: "sam", body: "hi", created: 1, state: "submitted", url: "", mine: false, canEdit: false, canDelete: false, ...extra });
 const thread = (id, comments, extra = {}) => ({
@@ -120,4 +120,28 @@ test("who changing under an open composer or dialog with nothing out says the ta
   const quiet = { sending: false, composer: null, dialog: null, checks: [] };
   assert.match(leaveNote({ ...quiet, composer: { phase: "editing", kind: "comment" } }), /started over\. What you typed is kept/);
   assert.match(leaveNote({ ...quiet, dialog: { phase: "choose", kind: "" } }), /started over/);
+});
+
+test("signed out, not someone else: said as a sign-out, what was out still not known", () => {
+  const quiet = { sending: false, composer: null, dialog: null, checks: [], signedOut: true };
+  const out = leaveNote({ ...quiet, sending: true, composer: { phase: "sending", kind: "comment" } });
+  assert.match(out, /^Signed out of GitHub now: check the PR on GitHub/);
+  assert.match(out, /Not known whether your comment went through/);
+  assert.doesNotMatch(out, /someone else/);
+  assert.match(leaveNote({ ...quiet, dialog: { phase: "choose", kind: "" } }), /^Signed out of GitHub now, so the Files tab started over/);
+  assert.equal(leaveNote(quiet), "");
+});
+
+test("a held note stays first; what's said after shows under it, never in its place", () => {
+  const held = ["Signed in as someone else now: check the PR on GitHub before sending again. Not known whether your reply went through."];
+  // A failing Overview read, then a flash, then busy: each replaces the
+  // last thing said, and none the held note.
+  assert.deepEqual(noteLines({ held, busy: "", err: "exec: connection lost", flash: "" }), [
+    { text: held[0], kind: "held" },
+    { text: "exec: connection lost", kind: "err" },
+  ]);
+  assert.deepEqual(noteLines({ held, busy: "", err: "", flash: "Copied" }).map((l) => l.kind), ["held", "flash"]);
+  assert.deepEqual(noteLines({ held, busy: "Merging…", err: "x", flash: "" }).map((l) => l.kind), ["held", "busy"]);
+  assert.deepEqual(noteLines({ held, busy: "", err: "", flash: "" }).map((l) => l.kind), ["held"], "nothing said: it's still there");
+  assert.deepEqual(noteLines({ held: [], busy: "", err: "e", flash: "f" }), [{ text: "e", kind: "err" }], "none held: as before");
 });

@@ -19,7 +19,8 @@ import { PR_TABS, tabFor, prRoute } from "./prkeys.js";
 import { FilesView } from "./files.js";
 import { sendOnce, MutationGate, MUTATION_TIMEOUT } from "./mutation.js";
 import { reviewChip } from "./follow.js";
-import { askSignedIn } from "./reads.js";
+import { noteLines } from "./sent.js";
+import { askSignedIn, mayLook } from "./reads.js";
 import { Store } from "./store.js";
 import { whoOf, sameWho, mergeWho, empty, seed, listPatch, resolveRepo, pickedRepo, staleMark, stamper, takesOver, canAct } from "./cache.js";
 
@@ -242,6 +243,10 @@ export default class GitHub extends View {
     this.flash = "";
     this.err = "";
     this.statusErr = ""; // the last status error said (statusFailed): only it is cleared or replaced by status
+    // What must stay said (hold): a change not known to have gone when who
+    // changed. Shown above what's said now, until dismissed or the user
+    // leaves the screen it's on.
+    this.notices = [];
     this.busy = "";
     this.acting = new Set(); // the PRs (keys) a change was sent for, until GitHub answers
     this.gate = new MutationGate(); // changes out, against which polls are ordered
@@ -260,6 +265,7 @@ export default class GitHub extends View {
     this.cache = empty("lists");
     this.who = null;
     this.gen = 0;
+    this.signedOut = false; // why gen last moved (forget): a sign-out, not someone else
     this.confirmed = new Promise((resolve) => (this.confirm = resolve));
     this.width = 900;
     this.from = p.back ?? null; // the mod it was opened from, to go back to
@@ -323,9 +329,13 @@ export default class GitHub extends View {
     cx.timer.every(60000, (cx) => this.screen === "list" && !this.busy && this.loadAll(cx));
     // The open PR's Files tab follows it (files.js decides when to read).
     cx.timer.every(1000, (cx) => this.files?.tick(cx));
-    // Status not confirmed yet (it failed): ask again, or nothing is kept.
+    // Status not confirmed yet (it failed), or confirmed but its machine
+    // lost since (a person's search failed, `on` null: every automatic read
+    // fails until one is found): ask again, or nothing is kept and nothing
+    // is read. The one timer that looks while a PR is open: if it finds
+    // someone else, settle says so on the screen the user lands on.
     cx.timer.every(60000, (cx) => {
-      if (this.demo || this.who) return;
+      if (this.demo || (this.who && this.on != null)) return;
       cx.spawn(async (cx) => {
         try {
           await this.findGitHub();
@@ -359,6 +369,7 @@ export default class GitHub extends View {
         else if (c === "demo") {
           this.demo = !this.demo;
           this.gen++;
+          this.notices = [];
           this.lists = {};
           this.screen = "list";
           this.repo = null;
@@ -436,7 +447,10 @@ export default class GitHub extends View {
   }
 
   // Drops every list and cached detail shown, and every answer on its way.
-  forget() {
+  // `signedOut`: nobody is signed in now (statusFailed), rather than someone
+  // else (confirmWho); settle says which.
+  forget(signedOut = false) {
+    this.signedOut = signedOut;
     this.gen++;
     this.lists = {};
     this.cache = empty("lists", this.who);
@@ -452,13 +466,15 @@ export default class GitHub extends View {
   // The Files tab's state (its pending review, "mine", the dialog) is the
   // other account's, and a change made from it must not go as the new one
   // (mutate refuses it too). What it had out is said not known before it
-  // goes, and said last, so it's on the screen the user lands on.
+  // goes, and held (hold) on the screen the user lands on: nothing said
+  // later replaces it. With nothing out, the user is still told why the
+  // screen changed under them.
   settle(cx) {
     if (this.settledGen === this.gen) return;
     this.settledGen = this.gen;
     if (this.screen === "pr" && this.cur) {
       const was = this.err;
-      const note = this.files?.leave() ?? "";
+      const note = this.files?.leave(this.signedOut) ?? "";
       if (!this.direct) {
         this.files = null;
         this.toList(cx);
@@ -470,12 +486,16 @@ export default class GitHub extends View {
         this.detail = null;
         this.detailInfo = null;
         this.menu = this.parked = null;
-        this.loadDetail(cx);
+        // Owed because who changed, not asked for: it never looks again.
+        this.loadDetail(cx, "auto");
         this.keys.focus();
       }
-      if (note) this.say(note, cx, true);
+      if (note) this.hold(note, cx);
       // toList cleared it: status's "Not signed in" still stands.
-      else if (was && was === this.statusErr) this.err = was;
+      if (was && was === this.statusErr) this.err = was;
+      else if (!note && !this.signedOut) {
+        this.say(this.direct ? "Signed in as someone else now: the PR is read again as them." : "Signed in as someone else now, so the lists started over.", cx);
+      }
     }
     this.loadMissing(cx);
     cx.notify();
@@ -491,15 +511,20 @@ export default class GitHub extends View {
     const said = e instanceof DevError ? e.message : `Not signed in to GitHub on any machine: ${e?.message ?? e}. Run gh auth login on one.`;
     if (!this.err || this.err === this.statusErr) this.err = said;
     this.statusErr = said;
-    if (!(e instanceof DevError) && e?.cachedSignedOut) this.forget();
+    if (!(e instanceof DevError) && e?.cachedSignedOut) {
+      // Nobody is who was: forgotten once, said as a sign-out (settle), and
+      // with who gone the next re-ask can't find the same sign-out again.
+      this.who = null;
+      this.forget(true);
+    }
   }
 
   // One request where gh is signed in; `opts` go to exec (see ask), but
-  // `auto`: nobody asked for it (a poll), so a failure doesn't look for
-  // GitHub again (reads.js).
-  /** @param {{ timeout?: number, auto?: boolean }} [opts] */
+  // `why` it's asked (reads.js Why: "asked", "list", "auto") decides whether
+  // a failure may look for GitHub again, as the screen is when it fails.
+  /** @param {{ timeout?: number, why?: import("./reads.js").Why }} [opts] */
   async gh(req, opts = {}) {
-    const { auto = false, ...execOpts } = opts;
+    const { why = "list", ...execOpts } = opts;
     if (this.demo) return ask({ ...req, demo: true }, null, execOpts);
     return askSignedIn({
       ask: () => ask(req, this.on || null, execOpts),
@@ -508,8 +533,14 @@ export default class GitHub extends View {
       // The machine went away, or herdr-github couldn't be fetched there:
       // look again. Not for GitHub's answer, a slow one, or a dev build's.
       settled: (e) => e instanceof AppError || e instanceof TimedOut || e instanceof DevError,
-      auto,
+      look: () => this.mayLook(why),
     });
+  }
+
+  // Whether a read made for `why` may look for GitHub now (reads.js).
+  /** @param {import("./reads.js").Why} why */
+  mayLook(why) {
+    return mayLook(why, this.screen === "pr");
   }
 
   // A change to GitHub, sent once (mutation.js): never asked again, here or
@@ -627,8 +658,9 @@ export default class GitHub extends View {
 
   // ── lists ──────────────────────────────────────────────────────────────
 
-  loadAll(cx) {
-    for (const t of TABS) this.load(t.id, cx);
+  /** @param {import("./reads.js").Why} [why] */
+  loadAll(cx, why = "list") {
+    for (const t of TABS) this.load(t.id, cx, false, why);
   }
 
   // The tabs with no live answer and none on its way.
@@ -676,7 +708,9 @@ export default class GitHub extends View {
     });
   }
 
-  load(tab, cx, more = false) {
+  // `why` (reads.js): the lists' own, unless a change owes it ("auto").
+  /** @param {import("./reads.js").Why} [why] */
+  load(tab, cx, more = false, why = "list") {
     if (tab === "repo" && !more && !this.lists.repo?.loaded) seed(this.list("repo"), this.cache.repos[this.repoSpec()]);
     const l = this.list(tab);
     if (l.loading || (more && !l.next)) return;
@@ -697,12 +731,13 @@ export default class GitHub extends View {
       let res = null;
       let err = null;
       try {
-        res = await this.gh(req).catch(async (e) => {
+        res = await this.gh(req, { why }).catch(async (e) => {
           // Asked on the cache's machine before status answered, and it's
-          // signed out there: ask again wherever status finds GitHub.
-          if (!early || !e?.signedOut || this.demo) throw e;
+          // signed out there: ask again wherever status finds GitHub. Only
+          // for a read that may look (not while a PR is showing).
+          if (!early || !e?.signedOut || this.demo || !this.mayLook(why)) throw e;
           await this.findGitHub();
-          return this.gh(req);
+          return this.gh(req, { why });
         });
       } catch (e) {
         err = e;
@@ -730,7 +765,7 @@ export default class GitHub extends View {
   reload(cx) {
     if (this.screen === "pr") {
       if (this.prTab === "files") this.files?.reload(cx);
-      return this.loadDetail(cx);
+      return this.loadDetail(cx, "asked");
     }
     this.loadAll(cx);
   }
@@ -762,7 +797,10 @@ export default class GitHub extends View {
   enter(cx) {
     if (this.pickingRepo()) return this.pickRepo(this.shownRepos()[this.at], cx);
     const pr = this.shown?.[this.at];
-    if (pr) this.openPR(pr, cx);
+    if (!pr) return;
+    // The user leaves the list: what was held on it has been seen.
+    this.notices = [];
+    this.openPR(pr, cx);
   }
 
   // ── the repo tab's repos ───────────────────────────────────────────────
@@ -817,34 +855,39 @@ export default class GitHub extends View {
     this.files = new FilesView(this, this.filesUI);
     this.err = this.flash = "";
     this.direct = direct;
-    this.loadDetail(cx);
+    this.loadDetail(cx, "asked");
     this.showCachedDetail(pr, cx);
     this.loadSessions(cx);
     cx.timer.after(30, () => this.keys.focus());
     cx.notify();
   }
 
-  loadDetail(cx) {
+  // The open PR's detail. `why` (reads.js): "asked" when a person opened the
+  // PR or pressed r; "auto" when it's read again after a change or after
+  // who changed, which never looks for GitHub.
+  /** @param {import("./reads.js").Why} why */
+  loadDetail(cx, why) {
     const pr = this.cur;
     const at = this.stamp();
     const gen = this.gen;
     const early = !this.who;
     cx.spawn(async (cx) => {
       try {
-        const d = await this.gh({ op: "detail", pr: prID(pr) });
+        const d = await this.gh({ op: "detail", pr: prID(pr) }, { why });
         // Asked as an account that's since changed: settle asks again.
         if (gen !== this.gen) return;
         this.keepDetail(pr.key, d, at);
-        if (!this.showDetail(pr.key, d, { at, cached: false })) return;
+        if (!this.showDetail(pr.key, d, { at, cached: false, gen })) return;
         this.cur = { ...pr, ...d };
         this.replaceRow(d);
       } catch (e) {
         if (gen !== this.gen || this.screen !== "pr" || this.cur?.key !== pr.key) return;
         // Asked on the cache's machine before status answered, and it's
         // signed out there: once status finds GitHub, ask again (as load).
-        if (early && e?.signedOut && !this.demo) {
+        // Only for a read that may look.
+        if (early && e?.signedOut && !this.demo && this.mayLook(why)) {
           const found = await this.findGitHub().then(() => true, () => false);
-          if (found && gen === this.gen && this.screen === "pr" && this.cur?.key === pr.key) return this.loadDetail(cx);
+          if (found && gen === this.gen && this.screen === "pr" && this.cur?.key === pr.key) return this.loadDetail(cx, why);
         }
         this.err = String(e?.message ?? e);
         // A cached Overview stays, marked with why and how old; r tries again.
@@ -857,10 +900,12 @@ export default class GitHub extends View {
   // `d`, as the detail of the PR open (`key`), if it may replace what's
   // shown (cache.js takesOver): whether it did. Only the detail and what's
   // known about it change, never the tab, the chosen check or the scroll.
+  // `info.gen`: who it was read as (the request's gen), so nothing acts on
+  // it once who has changed (canAct).
   showDetail(key, d, info) {
     if (this.screen !== "pr" || this.cur?.key !== key || !takesOver(this.detailInfo, info)) return false;
     this.detail = d;
-    this.detailInfo = { at: info.at, cached: info.cached, error: "" };
+    this.detailInfo = { at: info.at, cached: info.cached, error: "", gen: info.gen };
     return true;
   }
 
@@ -873,7 +918,7 @@ export default class GitHub extends View {
       const doc = await this.store.read("details");
       const e = doc.details[pr.key];
       if (!e?.d || gen !== this.gen || !sameWho(doc.who, this.cachedWho())) return;
-      if (this.showDetail(pr.key, e.d, { at: e.saved, cached: true })) cx.notify();
+      if (this.showDetail(pr.key, e.d, { at: e.saved, cached: true, gen })) cx.notify();
     });
   }
 
@@ -891,7 +936,7 @@ export default class GitHub extends View {
   // Whether the PR shown may be acted on: never from a cached Overview (its
   // fields may be stale, and choices are built from them). Says why not.
   mayAct(cx) {
-    if (canAct(this.detail && { d: this.detail, ...this.detailInfo })) return true;
+    if (canAct(this.detail && { d: this.detail, ...this.detailInfo }, this.gen)) return true;
     this.say(this.detail ? "Refreshing…" : "Still loading…", cx);
     return false;
   }
@@ -920,7 +965,7 @@ export default class GitHub extends View {
         const d = await this.gh({ op: "detail", pr: prID(pr) });
         if (gen !== this.gen) return;
         this.keepDetail(pr.key, d, at);
-        if (this.showDetail(pr.key, d, { at, cached: true })) cx.notify();
+        if (this.showDetail(pr.key, d, { at, cached: true, gen })) cx.notify();
       } catch {
         // Warming is a convenience: opening the PR asks again.
       } finally {
@@ -938,6 +983,8 @@ export default class GitHub extends View {
   }
 
   back(cx) {
+    // The user leaves the PR: what was held on it has been seen.
+    this.notices = [];
     if (this.direct && this.backTo) {
       this.dismiss();
       return openOverlay({ mod: this.backTo.mod, kind: "dialog", width: 0.8, height: 0.8, props: this.backTo.props ?? {} });
@@ -1054,6 +1101,13 @@ export default class GitHub extends View {
     cx.notify();
   }
 
+  // Said and kept (sent.js noteLines): what `say` says next shows under it.
+  // It goes when the user dismisses it, or leaves the screen (back, enter).
+  hold(text, cx) {
+    if (!this.notices.includes(text)) this.notices.push(text);
+    cx.notify();
+  }
+
   // Changes the PR on GitHub, then reads it (and its lists) again. One
   // change to a PR at a time: a second d sent before the first answers
   // reads the draft state the first is changing.
@@ -1061,7 +1115,9 @@ export default class GitHub extends View {
     if (!this.mayAct(cx)) return;
     const pr = this.cur;
     if (this.acting.has(pr.key)) return this.say(`#${pr.number} is still changing: one change at a time.`, cx);
-    const made = this.gen;
+    // Built from the detail shown: it goes as the account that was read as,
+    // or not at all (mutation.js settleWho).
+    const made = this.detailInfo.gen;
     this.acting.add(pr.key);
     this.busy = label;
     this.menu = null;
@@ -1077,8 +1133,11 @@ export default class GitHub extends View {
       // What follows (a merge's cleanup) is about this PR: only while it's
       // still the one shown, never another PR's or the list's.
       if (ok && after && this.screen === "pr" && this.cur?.key === pr.key) after(pr, cx);
-      this.loadDetail(cx);
-      this.loadAll(cx);
+      // Read again because of the change, not because anyone asked: a
+      // dropped exec here never looks for GitHub (reads.js), so it can't
+      // change who and take the user off the PR.
+      this.loadDetail(cx, "auto");
+      this.loadAll(cx, "auto");
       cx.notify();
     });
   }
@@ -1115,7 +1174,7 @@ export default class GitHub extends View {
     const tree = this.treeOf(pr);
     const canDelete = d?.cleanup?.deleteBranch;
     if (!d || (!canDelete && !tree)) return;
-    const made = this.gen;
+    const made = this.detailInfo.gen;
     const clean = (branch, wt) => (cx) => {
       this.busy = "Cleaning up…";
       cx.notify();
@@ -1718,7 +1777,7 @@ export default class GitHub extends View {
           .child(div().flex_1())
           .when(Boolean(chipText), (el) => el.child(chip(o, "review", [icon("pr", o.work, 12), chipText], { color: o.work })))
           .when(Boolean(shownMark), (el) => el.child(div().min_w(0).truncate().text_size(12).text_color(info?.error ? o.fix : o.dim).child(shownMark)))
-          .when(Boolean(pr.updated) && !mark, (el) => el.child(div().text_size(12).text_color(o.dim).child(`updated ${ago(pr.updated, now)}`))),
+          .when(Boolean(pr.updated) && !shownMark, (el) => el.child(div().text_size(12).text_color(o.dim).child(`updated ${ago(pr.updated, now)}`))),
       )
       .child(div().flex_none().text_size(17).font_semibold().text_color(o.fg).line_height(1.35).child(pr.title))
       .when(Boolean(d), (el) => el.child(
@@ -1970,6 +2029,22 @@ export default class GitHub extends View {
     ];
   }
 
+  // One line at the foot (sent.js noteLines). A held one isn't cut short
+  // (what's not known is at its end), and has its own ×, which dismisses it.
+  noteView(o, n, i) {
+    const color = n.kind === "busy" ? o.accent : n.kind === "flash" ? o.muted : o.fix;
+    const text = div().flex_1().min_w(0).text_size(12).text_color(color).child(n.text);
+    return h_flex().flex_none().gap(8).items_center()
+      .when(n.kind === "busy", (el) => el.child(icon("work", o.accent, 12).spin(1100)))
+      .child(n.kind === "held" ? text : text.truncate())
+      .when(n.kind === "held", (el) => el.child(h_flex().id(`notice-${i}`).flex_none().p(2).rounded(4).cursor_pointer().hover((s) => s.bg(o.raised))
+        .on_click((_e, cx) => {
+          this.notices = this.notices.filter((t) => t !== n.text);
+          cx.notify();
+        })
+        .child(icon("cross", o.muted, 12))));
+  }
+
   render() {
     const t = theme();
     const o = tones(t);
@@ -1980,8 +2055,7 @@ export default class GitHub extends View {
       console.log(`github: first rows on ${this.tab} ${Date.now() - this.openedAt}ms after opening${this.lists[this.tab]?.cached ? " (cached)" : ""}`);
     }
     const summary = this.demo ? "Demo · made-up org" : this.login ? `${this.login}${this.on ? ` · on ${this.on}` : ""}` : "";
-    const note = this.busy || this.err || this.flash;
-    const noteColor = this.busy ? o.accent : this.err ? o.fix : o.muted;
+    const notes = noteLines({ held: this.notices, busy: this.busy, err: this.err, flash: this.flash });
     const pr = this.screen === "pr" && this.cur;
 
     return v_flex()
@@ -2013,9 +2087,7 @@ export default class GitHub extends View {
         .child(this.listView(o)))
       .when(Boolean(pr), (el) => el.child(this.prView(o)))
       .when(this.menuShown(), (el) => el.child(this.menuView(o)))
-      .when(Boolean(note), (el) => el.child(h_flex().flex_none().gap(8).items_center()
-        .when(Boolean(this.busy), (el) => el.child(icon("work", o.accent, 12).spin(1100)))
-        .child(div().flex_1().min_w(0).truncate().text_size(12).text_color(noteColor).child(note))))
+      .children(notes.map((n, i) => this.noteView(o, n, i)))
       .child(h_flex().flex_none().gap(14).flex_wrap().items_center().pt(8).border_t_1().border_color(o.line).children(this.footer(o)));
   }
 }

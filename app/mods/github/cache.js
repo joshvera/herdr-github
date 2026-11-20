@@ -259,10 +259,12 @@ export function takesOver(shown, next) {
   return Boolean(shown.cached) || next.at > shown.at;
 }
 
-// Whether what's shown may be acted on: a detail, and a live one. Every
-// choice built from its fields (merge, draft, clean-up) asks first.
-export function canAct(shown) {
-  return Boolean(shown?.d) && !shown.cached;
+// Whether what's shown may be acted on: a detail, a live one, and read as
+// the account signed in now (`gen`: main's, which moves when who changes;
+// settle drops the detail, but up to 200 ms later). Every choice built from
+// its fields (merge, draft, clean-up) asks first.
+export function canAct(shown, gen) {
+  return Boolean(shown?.d) && !shown.cached && shown.gen === gen;
 }
 
 // The quiet mark on something shown from the cache: being refreshed, or why

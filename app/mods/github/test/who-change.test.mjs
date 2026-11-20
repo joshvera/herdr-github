@@ -22,8 +22,8 @@ function body(src, name) {
 
 test("F1a: every Files tab read goes through one place, which looks for GitHub again only when a person asked", () => {
   assert.equal([...files.matchAll(/this\.app\.gh\(/g)].length, 1, "files.js asks gh only in read()");
-  assert.match(body(files, "read"), /this\.app\.gh\(req, \{ \.\.\.opts, auto: !user \}\)/);
-  assert.match(body(main, "gh"), /askSignedIn\(\{[^}]*auto/s, "main's gh hands auto to the rule");
+  assert.match(body(files, "read"), /this\.app\.gh\(req, \{ \.\.\.opts, why: user \? "asked" : "auto" \}\)/);
+  assert.match(body(main, "gh"), /look: \(\) => this\.mayLook\(why\)/, "main's gh hands the rule, asked when it would look");
 });
 
 test("F1a: a poll, a reload owed after a change, and a diff are automatic; only shown and r are a person's", () => {
@@ -39,12 +39,38 @@ test("F1a: a poll, a reload owed after a change, and a diff are automatic; only 
   assert.ok(started.length >= 2 && started.every((i) => inside(i, shown) || inside(i, reload)));
 });
 
-test("F1b: a who change on the PR screen says what was out before dropping it, after the screen it lands on is drawn", () => {
+test("F1b: a who change on the PR screen says what was out before dropping it, held on the screen it lands on", () => {
   const s = body(main, "settle");
-  const leave = s.indexOf("this.files?.leave()");
+  const leave = s.indexOf("this.files?.leave(this.signedOut)");
   const toList = s.indexOf("this.toList(cx)");
   assert.ok(leave >= 0 && toList > leave, "leave() before the list");
-  assert.ok(s.lastIndexOf("this.say(") > toList, "said after toList, which clears what's said");
+  assert.ok(s.indexOf("this.hold(note, cx)") > toList, "held after toList, which clears what's said");
+  // Nothing out: still told why the screen changed (the 60 s re-ask may do it).
+  assert.ok(s.lastIndexOf("this.say(") > toList);
+});
+
+test("F1b: what's held goes only when the user leaves the screen it's on, never when toList or say run", () => {
+  for (const name of ["back", "enter"]) assert.match(body(main, name), /this\.notices = \[\];/, name);
+  for (const name of ["toList", "say", "openPR", "settle", "statusFailed"]) assert.doesNotMatch(body(main, name), /this\.notices =/, name);
+});
+
+test("F3: a who change's reads on the PR screen are automatic; opening it and r may look", () => {
+  assert.match(body(main, "settle"), /this\.loadDetail\(cx, "auto"\)/);
+  const act = body(main, "act");
+  assert.match(act, /this\.loadDetail\(cx, "auto"\)/);
+  assert.match(act, /this\.loadAll\(cx, "auto"\)/);
+  assert.match(body(main, "openPR"), /this\.loadDetail\(cx, "asked"\)/);
+  assert.match(body(main, "reload"), /this\.loadDetail\(cx, "asked"\)/);
+  // Every loadDetail says why; the two searches outside gh obey the same rule.
+  assert.equal([...main.matchAll(/this\.loadDetail\(cx\)/g)].length, 0);
+  assert.match(body(main, "loadDetail"), /this\.mayLook\(why\)\) \{\n\s*const found = await this\.findGitHub\(\)/);
+  assert.match(body(main, "load"), /!this\.mayLook\(why\)\) throw e;\n\s*await this\.findGitHub\(\)/);
+});
+
+test("F4: a sign-out found by status forgets once, as a sign-out", () => {
+  const s = body(main, "statusFailed");
+  assert.match(s, /this\.who = null;\n\s*this\.forget\(true\);/);
+  assert.match(body(main, "forget"), /this\.signedOut = signedOut;/);
 });
 
 test("F1b: leaving lets go of the composer, the dialog and the delete's y, its drafts written", () => {
@@ -58,7 +84,7 @@ test("F2: a who change gives a PR opened straight a fresh Files tab and drops it
   const s = body(main, "settle");
   assert.match(s, /this\.files = new FilesView\(this, this\.filesUI\)/);
   assert.match(s, /this\.detail = null/);
-  assert.match(s, /this\.loadDetail\(cx\)/);
+  assert.match(s, /this\.loadDetail\(cx, "auto"\)/);
 });
 
 test("F2: a view outlived by a who change is dead, and each change it sends carries the who it was made under", () => {

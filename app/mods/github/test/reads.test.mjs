@@ -1,7 +1,7 @@
 // When a read may look for GitHub again (reads.js).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { askSignedIn, NOT_YET } from "../reads.js";
+import { askSignedIn, mayLook, NOT_YET } from "../reads.js";
 
 // A machine that may drop the exec, and a search that counts itself.
 function rig({ chosen = true, fails = 1 } = {}) {
@@ -18,10 +18,42 @@ function rig({ chosen = true, fails = 1 } = {}) {
     },
     chosen: () => r.chosen,
     settled: (e) => e?.settled === true,
-    auto,
+    look: () => !auto,
   });
   return r;
 }
+
+test("while a PR is showing, only a person's read there may look: a change's follow-up and the lists' own may not", () => {
+  // Opening the PR, r, the Files tab shown.
+  assert.equal(mayLook("asked", true), true);
+  // Read again after a change (draft, ready, merge), after who changed, a
+  // poll, a diff: never, on any screen.
+  assert.equal(mayLook("auto", true), false);
+  assert.equal(mayLook("auto", false), false);
+  // The lists' timer, warming, a repo picked: as ever on the list only.
+  assert.equal(mayLook("list", true), false);
+  assert.equal(mayLook("list", false), true);
+});
+
+test("a list read started on the list that fails once a PR is open doesn't look: decided when it would, not when asked", async () => {
+  const screen = { pr: false };
+  const r = rig();
+  const args = { ...r.args(false), look: () => mayLook("list", screen.pr) };
+  const ask = args.ask;
+  // enter opens a PR while the exec is out; then it drops.
+  args.ask = async () => {
+    screen.pr = true;
+    return ask();
+  };
+  await assert.rejects(askSignedIn(args), /connection lost/);
+  assert.equal(r.finds, 0, "no search, so no who change under the PR");
+});
+
+test("a follow-up read after a change, on the PR screen, with no machine chosen fails without looking", async () => {
+  const r = rig({ chosen: false, fails: 0 });
+  await assert.rejects(askSignedIn({ ...r.args(false), look: () => mayLook("auto", true) }), new RegExp(NOT_YET));
+  assert.equal(r.finds, 0);
+});
 
 test("an automatic read that fails just fails: no search, so no who change", async () => {
   const r = rig();

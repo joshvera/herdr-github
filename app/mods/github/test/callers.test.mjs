@@ -24,8 +24,13 @@ for (const name of ["act", "toggleDraft", "mergeMenu", "cleanupMenu"]) {
   });
 }
 
-test("mayAct is canAct on what's shown", () => {
-  assert.match(body("mayAct"), /canAct\(this\.detail && \{ d: this\.detail, \.\.\.this\.detailInfo \}\)/);
+test("mayAct is canAct on what's shown, against who is signed in now", () => {
+  assert.match(body("mayAct"), /canAct\(this\.detail && \{ d: this\.detail, \.\.\.this\.detailInfo \}, this\.gen\)/);
+});
+
+test("a change from the Overview is made under the gen its detail was read as", () => {
+  for (const name of ["act", "cleanupMenu"]) assert.match(body(name), /const made = this\.detailInfo\.gen;/, name);
+  assert.match(body("showDetail"), /gen: info\.gen/);
 });
 
 test("delete-branch, the one change sent without act, is only in cleanupMenu", () => {

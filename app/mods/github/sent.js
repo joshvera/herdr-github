@@ -138,10 +138,10 @@ export function viewedAfter(kind, was, to) {
 }
 
 // Who changed while the Files tab had something out (main's settle drops the
-// view: its pending review, threads and checks are another account's). What
-// was sent, or being checked, is said not known before it goes, with where
-// to look first: the line it's said on is cut to fit. Drafts stay (they're
-// written as the view closes).
+// view: its pending review, threads and checks are another account's), or
+// whoever it was signed out (`signedOut`). What was sent, or being checked,
+// is said not known before it goes, with where to look first. Drafts stay
+// (they're written as the view closes). main holds what's said (noteLines).
 //
 //   composer / dialog sending or checking ─► "your comment", "your review"…
 //   a check left (x, shift-d unknown) ─────► "a resolve", "a delete"
@@ -153,10 +153,11 @@ const OUT = new Set(["sending", "checking"]);
 
 /**
  * @param {{ sending: boolean, composer: { phase: string, kind: string } | null,
- *   dialog: { phase: string, kind: string } | null, checks: any[] }} s
+ *   dialog: { phase: string, kind: string } | null, checks: any[], signedOut?: boolean }} s
  * @returns {string} "" when there's nothing to say
  */
-export function leaveNote({ sending, composer, dialog, checks }) {
+export function leaveNote({ sending, composer, dialog, checks, signedOut = false }) {
+  const now = signedOut ? "Signed out of GitHub now" : "Signed in as someone else now";
   const what = [];
   if (composer && OUT.has(composer.phase)) what.push(COMPOSED[composer.kind] ?? "your comment");
   if (dialog && OUT.has(dialog.phase)) what.push(dialog.kind === "discard" ? "the discard" : "your review");
@@ -165,8 +166,30 @@ export function leaveNote({ sending, composer, dialog, checks }) {
   if (sending && composer?.phase !== "sending" && dialog?.phase !== "sending") what.push("a change");
   if (what.length) {
     const which = what.length === 1 ? what[0] : `${what.length} changes`;
-    return `Signed in as someone else now: check the PR on GitHub before sending again. Not known whether ${which} went through.`;
+    return `${now}: check the PR on GitHub before sending again. Not known whether ${which} went through.`;
   }
-  if (composer || dialog) return "Signed in as someone else now, so the Files tab started over. What you typed is kept as a draft.";
+  if (composer || dialog) return `${now}, so the Files tab started over. What you typed is kept as a draft.`;
   return "";
+}
+
+// The popup's foot: what's held (main's hold: leaveNote's, until dismissed
+// or the user leaves the screen it's on) first, then what's said now, the
+// busy line before an error before a flash. Nothing said replaces a held
+// line: it shows under it.
+//
+//   held… ─────────────► each its own line, kept
+//   busy | err | flash ─► one line, the next `say` replaces it
+
+/**
+ * @typedef {{ text: string, kind: "held" | "busy" | "err" | "flash" }} NoteLine
+ * @param {{ held: string[], busy: string, err: string, flash: string }} s
+ * @returns {NoteLine[]}
+ */
+export function noteLines({ held, busy, err, flash }) {
+  /** @type {NoteLine[]} */
+  const lines = held.map((text) => ({ text, kind: "held" }));
+  if (busy) lines.push({ text: busy, kind: "busy" });
+  else if (err) lines.push({ text: err, kind: "err" });
+  else if (flash) lines.push({ text: flash, kind: "flash" });
+  return lines;
 }

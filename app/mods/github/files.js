@@ -255,7 +255,7 @@ export class FilesView {
   // read owed after a change, a diff) just fails (reads.js), so a dropped
   // exec can't change who and start everything over.
   read(req, opts = {}, user = false) {
-    return this.app.gh(req, { ...opts, auto: !user });
+    return this.app.gh(req, { ...opts, why: user ? "asked" : "auto" });
   }
 
   // The tab came into view: its files, the first time.
@@ -1053,13 +1053,15 @@ export class FilesView {
   // "mine", what's held and checked) is another account's, and goes with
   // it. What was out is said not known first (sent.js leaveNote), what's
   // typed is written, and nothing here can take the keyboard when an answer
-  // for it comes later. What to say, or "".
-  leave() {
+  // for it comes later. `signedOut`: nobody is signed in now, rather than
+  // someone else. What to say, or "".
+  leave(signedOut = false) {
     const note = leaveNote({
       sending: this.sending,
       composer: this.composer && { phase: this.composer.phase, kind: this.composer.target.kind },
       dialog: this.dialog && { phase: this.dialog.phase, kind: this.dialog.sent?.kind ?? "" },
       checks: this.checks,
+      signedOut,
     });
     this.close();
     this.composer = null;

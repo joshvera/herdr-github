@@ -329,12 +329,12 @@ test("a live answer replaces a cached one, and a later live one an earlier", () 
 });
 
 test("canAct: false while cached, false after a failed refresh, true after a fresh answer", () => {
-  const cached = { d: { number: 1 }, at: 1, cached: true };
-  assert.equal(canAct(cached), false);
-  assert.equal(canAct({ ...cached, error: "timed out" }), false);
-  assert.equal(canAct({ d: { number: 1 }, at: 2, cached: false }), true);
-  assert.equal(canAct(null), false);
-  assert.equal(canAct({ d: null, at: 1, cached: false }), false);
+  const cached = { d: { number: 1 }, at: 1, cached: true, gen: 0 };
+  assert.equal(canAct(cached, 0), false);
+  assert.equal(canAct({ ...cached, error: "timed out" }, 0), false);
+  assert.equal(canAct({ d: { number: 1 }, at: 2, cached: false, gen: 0 }, 0), true);
+  assert.equal(canAct(null, 0), false);
+  assert.equal(canAct({ d: null, at: 1, cached: false, gen: 0 }, 0), false);
 });
 
 test("the stale mark says it's refreshing, or why not, with the age; nothing when live", () => {
