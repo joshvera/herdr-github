@@ -11,12 +11,14 @@
 
 import { View, div } from "gpui-kit";
 import * as fs from "fs/promises";
-import { v_flex, h_flex, InputState, Input, TextView, Scrollbar, v_virtual_list, VirtualListScrollHandle, ScrollHandle } from "gpui-base";
+import { v_flex, h_flex, InputState, TextareaState, Input, TextView, Scrollbar, v_virtual_list, VirtualListScrollHandle, ScrollHandle } from "gpui-base";
 import { agents, panes, machines, spaces, run, exec, theme, appHome, props, closeOverlay, openOverlay, nextCommand, knownAgents } from "herdr";
 import { demoAgents, DEMO_REPO } from "./demo.js";
 import { tones, tint, countPill, groupOf, toneColor, prLook, checkLook, ago, icon, chip, words, key, cap, MONO } from "./look.js";
 import { PR_TABS, tabFor, prRoute } from "./prkeys.js";
 import { FilesView } from "./files.js";
+import { sendOnce, MutationGate, MUTATION_TIMEOUT } from "./mutation.js";
+import { reviewChip } from "./follow.js";
 
 // The herdr-github this mod is part of (its release; the repo's tests hold it
 // to herdr-plugin.toml's version).
@@ -228,6 +230,7 @@ export default class GitHub extends View {
     this.err = "";
     this.busy = "";
     this.acting = new Set(); // the PRs (keys) a change was sent for, until GitHub answers
+    this.gate = new MutationGate(); // changes out, against which polls are ordered
     this.repo = null;
     this.picking = false; // the repo tab's list of repos
     this.repos = null;
@@ -272,7 +275,21 @@ export default class GitHub extends View {
     filter.on("focus", (_e, cx) => this.files?.filterFocus(true, cx));
     filter.on("blur", (_e, cx) => this.files?.filterFocus(false, cx));
     filter.on("submit", (_e, cx) => this.files?.typingKey("enter", cx));
-    this.filesUI = { filter, diffScroll: VirtualListScrollHandle.new(), treeScroll: VirtualListScrollHandle.new(), height: PR_BODY_H };
+    // The composer's text box: grows with what's typed, 3 to 10 rows.
+    const composer = TextareaState.new({ placeholder: "Write a comment. Markdown works." });
+    composer.set_auto_grow(3, 10);
+    composer.on("change", (_e, cx) => this.files?.composerChanged(composer.value(), cx));
+    composer.on("focus", (_e, cx) => this.files?.composerFocus(true, cx));
+    composer.on("blur", (_e, cx) => this.files?.composerFocus(false, cx));
+    composer.on("submit", (e, cx) => this.files?.composerSubmit(e, cx));
+    // The submit dialog's text box: the review's own text.
+    const reviewBody = TextareaState.new({ placeholder: "Say something about the whole PR (optional)" });
+    reviewBody.set_auto_grow(3, 8);
+    reviewBody.on("change", (_e, cx) => this.files?.dialogBodyChanged(reviewBody.value(), cx));
+    reviewBody.on("focus", (_e, cx) => this.files?.dialogFocus(true, cx));
+    reviewBody.on("blur", (_e, cx) => this.files?.dialogFocus(false, cx));
+    reviewBody.on("submit", (e, cx) => this.files?.dialogSubmit(e, cx));
+    this.filesUI = { filter, composer, reviewBody, diffScroll: VirtualListScrollHandle.new(), treeScroll: VirtualListScrollHandle.new(), height: PR_BODY_H };
 
     cx.spawn(async (cx) => {
       await this.readCache(cx);
@@ -281,6 +298,8 @@ export default class GitHub extends View {
       cx.notify();
     });
     cx.timer.every(60000, (cx) => this.screen === "list" && !this.busy && this.loadAll(cx));
+    // The open PR's Files tab follows it (files.js decides when to read).
+    cx.timer.every(1000, (cx) => this.files?.tick(cx));
 
     // Key bindings and `herdr-app do`: github.escape, github.tab,
     // github.backtab, github.demo, github.next, github.prev, github.reload.
@@ -347,6 +366,31 @@ export default class GitHub extends View {
       // The machine went away, or herdr-github couldn't be fetched there: look again.
       await this.findGitHub();
       return ask(req, this.on || null, opts);
+    }
+  }
+
+  // A change to GitHub, sent once (mutation.js): never asked again, here or
+  // on another machine. The machine is looked for first, only when none is
+  // chosen yet. Polls wait on this.gate while one is out.
+  /** @returns {Promise<import("./mutation.js").Outcome>} */
+  async mutate(req) {
+    if (!this.demo && (this.on == null || !this.login)) {
+      try {
+        await this.findGitHub();
+      } catch (e) {
+        return { kind: "refused", error: `Nothing was sent: ${e?.message ?? e}`, answer: null };
+      }
+    }
+    const machine = this.demo ? null : this.on || null;
+    const body = JSON.stringify(this.demo ? { ...req, demo: true } : req);
+    this.gate.begin();
+    try {
+      return await sendOnce({
+        prepare: () => binary(machine),
+        run: (bin) => exec("sh", ["-c", 'exec "$0" app "$1"', bin, body], { timeout: MUTATION_TIMEOUT, on: machine }),
+      });
+    } finally {
+      this.gate.end();
     }
   }
 
@@ -607,6 +651,13 @@ export default class GitHub extends View {
     this.dismiss();
   }
 
+  // The popup is going (closed, or the app quitting): drafts typed on the
+  // Files tab are written now, and onto disk before the 250 ms run out.
+  async close() {
+    this.files?.close();
+    await localStorage.flush();
+  }
+
   dismiss() {
     this.closing = true;
     closeOverlay(props().overlay);
@@ -676,14 +727,11 @@ export default class GitHub extends View {
     this.menu = null;
     cx.notify();
     cx.spawn(async (cx) => {
-      let ok = false;
-      try {
-        const res = await this.gh({ op: "act", ...what, pr: prID(pr) });
-        this.say(res.note ?? "Done", cx);
-        ok = true;
-      } catch (e) {
-        this.say(String(e?.message ?? e), cx, true);
-      }
+      const r = await this.mutate({ op: "act", ...what, pr: prID(pr) });
+      const ok = r.kind === "ok";
+      if (ok) this.say(r.answer.note ?? "Done", cx);
+      else if (r.kind === "refused") this.say(r.error, cx, true);
+      else this.say("No answer. Check the PR before trying again.", cx, true);
       this.acting.delete(pr.key);
       this.busy = "";
       // What follows (a merge's cleanup) is about this PR: only while it's
@@ -733,12 +781,10 @@ export default class GitHub extends View {
         const done = [];
         const failed = [];
         if (branch) {
-          try {
-            await this.gh({ op: "act", do: "delete-branch", pr: prID(pr) });
-            done.push("branch deleted");
-          } catch (e) {
-            failed.push(`branch not deleted: ${e?.message ?? e}`);
-          }
+          const r = await this.mutate({ op: "act", do: "delete-branch", pr: prID(pr) });
+          if (r.kind === "ok") done.push("branch deleted");
+          else if (r.kind === "refused") failed.push(`branch not deleted: ${r.error}`);
+          else failed.push("no answer about the branch: check the PR before trying again");
         }
         if (wt) {
           try {
@@ -982,7 +1028,7 @@ export default class GitHub extends View {
     if (k === "escape") {
       if (!e.is_held) this.escape(cx);
     } else if (this.filesTyping()) {
-      this.files.typingKey(k, cx);
+      this.files.typingKey(k, cx, Boolean(e.is_held));
       return cx.notify();
     } else if (!this.press(k, cx, Boolean(e.is_held))) return;
     cx.stop_propagation();
@@ -1304,6 +1350,8 @@ export default class GitHub extends View {
     const now = Date.now();
     const from = this.direct && this.backTo?.label ? this.backTo.label : this.direct && this.from === "recap" ? "Recap" : this.tabLabel(TABS.find((x) => x.id === this.tab), true);
     const body = this.prTab === "checks" ? this.checksTab(o) : this.prTab === "files" ? this.files.view(o) : this.overviewTab(o);
+    // The pending review, as the Files tab last read it (absent until it has).
+    const chipText = this.files ? reviewChip(this.files.review, Boolean(this.files.data?.more)) : "";
 
     return v_flex().flex_1().min_h(0).gap(10)
       .child(
@@ -1316,6 +1364,7 @@ export default class GitHub extends View {
           .child(div().font_family(MONO).text_size(12.5).text_color(o.muted).child(`#${pr.number}`))
           .child(div().text_size(12.5).text_color(o.dim).child(pr.repo))
           .child(div().flex_1())
+          .when(Boolean(chipText), (el) => el.child(chip(o, "review", [icon("pr", o.work, 12), chipText], { color: o.work })))
           .when(Boolean(pr.updated), (el) => el.child(div().text_size(12).text_color(o.dim).child(`updated ${ago(pr.updated, now)}`))),
       )
       .child(div().flex_none().text_size(17).font_semibold().text_color(o.fg).line_height(1.35).child(pr.title))
@@ -1534,8 +1583,9 @@ export default class GitHub extends View {
     if (this.screen === "pr") {
       const tabs = k(["1", "2", "3"], "tabs", (cx) => this.setPrTab(tabFor("tab", this.prTab), cx), "f-tabs");
       const back = k(["esc"], "back", (cx) => this.escape(cx), "f-esc");
-      // While its filter has the keyboard, 1 2 3 and esc are the filter's.
-      if (this.prTab === "files") return this.files.typing ? this.files.footer(k) : [...this.files.footer(k), tabs, back];
+      // While a text box of its has the keyboard (or it asks something), 1 2
+      // 3 and esc are its own.
+      if (this.prTab === "files") return this.files.typing || this.files.modal() ? this.files.footer(k) : [...this.files.footer(k), tabs, back];
       if (this.prTab === "checks") {
         return [
           k(["↑", "↓"], "choose", () => {}, "f-ch"),

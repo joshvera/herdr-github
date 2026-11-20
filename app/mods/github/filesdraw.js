@@ -41,17 +41,26 @@ export function viewedMark(o, f) {
 }
 
 // One item of the diff: a row or a piece of a thread, with the cursor's
-// bar at its left. Drawn inside the list: no handlers.
-export function diffItem(o, it, on) {
+// bar at its left; `drafted`, a draft of yours waits on it. Drawn inside
+// the list: no handlers.
+export function diffItem(o, it, on, drafted = false) {
   const bar = div().flex_none().w(3).h_full().when(on, (el) => el.bg(o.accent));
-  const body = it.kind === "row" ? row(o, it.row, on)
-    : it.kind === "thread" ? threadHead(o, it, on)
+  const body = it.kind === "row" ? row(o, it.row, on, drafted)
+    : it.kind === "thread" ? threadHead(o, it, on, drafted)
     : it.kind === "hunk" ? hunk(o, it)
     : comment(o, it, on);
-  return h_flex().h(it.h).w_full().overflow_hidden().items_stretch().child(bar).child(body);
+  // A thread sits on its line's colour, as on GitHub: added green, deleted
+  // red, context none.
+  const under = it.kind !== "row" && (it.under === "add" ? o.review : it.under === "del" ? o.fix : null);
+  return h_flex().h(it.h).w_full().overflow_hidden().items_stretch()
+    .when(Boolean(under), (el) => el.bg(tint(under, 0.12)))
+    .child(bar).child(body);
 }
 
-function row(o, r, on) {
+// The "draft" mark: a draft of yours, not sent, on this line or thread.
+const draftMark = (o) => div().flex_none().px(5).rounded(4).bg(tint(o.work, 0.14)).text_size(10.5).text_color(o.work).child("draft");
+
+function row(o, r, on, drafted) {
   const num = (n) => div().flex_none().w(36).text_right().text_color(o.dim).child(n ? String(n) : "");
   const base = h_flex().flex_1().min_w(0).h_full().items_center().gap(8).pr(8).font_family(MONO).text_size(11.5)
     .when(on, (el) => el.bg(tint(o.accent, 0.2)));
@@ -61,16 +70,16 @@ function row(o, r, on) {
   return base.when(!on && Boolean(sign[2]), (el) => el.bg(sign[2]))
     .child(num(r.old)).child(num(r.new))
     .child(div().flex_none().w(10).text_color(sign[1]).child(sign[0]))
-    .child(div().flex_1().min_w(0).truncate().text_color(o.fg).child(r.text || " "));
+    .child(div().flex_1().min_w(0).truncate().text_color(o.fg).child(r.text || " "))
+    .when(drafted, (el) => el.child(draftMark(o)));
 }
 
 // A thread's first line: where it is, its state, who, how many; folded,
 // the start of its first comment too.
-function threadHead(o, it, on) {
+function threadHead(o, it, on, drafted) {
   const t = it.t;
   const first = t.comments[0];
   const n = t.comments.length;
-  const pending = t.comments.some((c) => c.state === "pending");
   return h_flex().flex_1().min_w(0).ml(INDENT).mr(12).mt(4).px(10).gap(8).items_center()
     .bg(on ? tint(o.accent, 0.16) : o.raised).border_1().border_color(on ? o.accent : o.line)
     .when(it.last, (el) => el.rounded(8).mb(0))
@@ -79,7 +88,7 @@ function threadHead(o, it, on) {
     .child(div().flex_none().font_family(MONO).text_size(11.5).text_color(o.muted).child(threadWhere(t) || "thread"))
     .when(t.outdated, (el) => el.child(chip(o, `out-${t.id}`, ["outdated"], { color: o.work })))
     .when(t.resolved, (el) => el.child(div().flex_none().text_size(11.5).text_color(o.review).child("resolved")))
-    .when(pending, (el) => el.child(chip(o, `pend-${t.id}`, ["pending, not sent"], { color: o.accent })))
+    .when(drafted, (el) => el.child(draftMark(o)))
     .child(div().flex_none().text_size(12).font_medium().text_color(o.fg).child(first?.author ?? ""))
     .child(div().flex_none().text_size(11.5).text_color(o.dim).child(n === 1 ? "1 comment" : `${n} comments`))
     .child(div().flex_1().min_w(0).truncate().text_size(12).text_color(o.dim)
@@ -98,6 +107,12 @@ function hunk(o, it) {
       .child(div().flex_1().min_w(0).truncate().text_color(o.muted).child(l.text))));
 }
 
+// A comment of a review not yet submitted: only you see it. Marked once
+// per comment, as GitHub does; the header's chip counts them.
+const pendingMark = (o) => h_flex().flex_none().h(18).px(7).gap(4).items_center().rounded_full()
+  .border_1().border_color(o.work).text_size(11).font_medium().text_color(o.work)
+  .child(div().w(6).h(6).rounded_full().bg(o.work)).child("Pending");
+
 // A piece of a comment: its author and age first, then its Markdown.
 function comment(o, it, on) {
   const c = it.c;
@@ -107,7 +122,7 @@ function comment(o, it, on) {
     .when(it.first, (el) => el.child(h_flex().flex_none().h(18).gap(8).items_center()
       .child(div().text_size(12).font_semibold().text_color(o.fg).child(c.author || "someone"))
       .child(div().text_size(11.5).text_color(o.dim).child(ago(c.created)))
-      .when(c.state === "pending", (el) => el.child(chip(o, `cp-${c.id}`, ["pending, not sent"], { color: o.accent })))))
+      .when(c.state === "pending", (el) => el.child(pendingMark(o)))))
     .when(Boolean(it.text), (el) => el.child(markdown(o, it)));
 }
 

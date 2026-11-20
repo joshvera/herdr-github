@@ -643,12 +643,16 @@ func sortChecks(cs []check) {
 
 // ── mutations ─────────────────────────────────────────────────────────────────
 
+// Each goes through mutate (mutate.go): one request, never repeated, and
+// refused told apart from unknown.
+
 func (c *ghClient) setDraft(ctx context.Context, prID string, draft bool) error {
-	q := `mutation($id: ID!) { markPullRequestReadyForReview(input: {pullRequestId: $id}) { pullRequest { isDraft } } }`
+	field := "markPullRequestReadyForReview"
 	if draft {
-		q = `mutation($id: ID!) { convertPullRequestToDraft(input: {pullRequestId: $id}) { pullRequest { isDraft } } }`
+		field = "convertPullRequestToDraft"
 	}
-	return c.graphql(ctx, q, map[string]any{"id": prID}, nil)
+	q := `mutation($id: ID!) { ` + field + `(input: {pullRequestId: $id}) { pullRequest { isDraft } } }`
+	return c.mutate(ctx, q, map[string]any{"id": prID}, field, nil)
 }
 
 // merge merges now, or with auto turns on auto-merge. The head commit is
@@ -657,47 +661,47 @@ func (c *ghClient) setDraft(ctx context.Context, prID string, draft bool) error 
 func (c *ghClient) merge(ctx context.Context, d *prDetail, method string, auto bool) error {
 	vars := map[string]any{"id": d.ID, "method": method, "oid": d.HeadRefOid}
 	if auto {
-		return c.graphql(ctx, `mutation($id: ID!, $method: PullRequestMergeMethod!, $oid: GitObjectID) {
+		return c.mutate(ctx, `mutation($id: ID!, $method: PullRequestMergeMethod!, $oid: GitObjectID) {
   enablePullRequestAutoMerge(input: {pullRequestId: $id, mergeMethod: $method, expectedHeadOid: $oid}) { clientMutationId }
-}`, vars, nil)
+}`, vars, "enablePullRequestAutoMerge", nil)
 	}
-	return c.graphql(ctx, `mutation($id: ID!, $method: PullRequestMergeMethod!, $oid: GitObjectID) {
+	return c.mutate(ctx, `mutation($id: ID!, $method: PullRequestMergeMethod!, $oid: GitObjectID) {
   mergePullRequest(input: {pullRequestId: $id, mergeMethod: $method, expectedHeadOid: $oid}) { clientMutationId }
-}`, vars, nil)
+}`, vars, "mergePullRequest", nil)
 }
 
 // enqueue adds the PR to its base branch's merge queue, which merges it
 // when its turn comes, by the queue's own method. Pinned to the head commit,
 // as merge is.
 func (c *ghClient) enqueue(ctx context.Context, d *prDetail) error {
-	return c.graphql(ctx, `mutation($id: ID!, $oid: GitObjectID) {
+	return c.mutate(ctx, `mutation($id: ID!, $oid: GitObjectID) {
   enqueuePullRequest(input: {pullRequestId: $id, expectedHeadOid: $oid}) { clientMutationId }
-}`, map[string]any{"id": d.ID, "oid": d.HeadRefOid}, nil)
+}`, map[string]any{"id": d.ID, "oid": d.HeadRefOid}, "enqueuePullRequest", nil)
 }
 
 // updateBranch merges the base branch into the PR's, as GitHub's "Update
 // branch" does (a merge, its default; updateMethod is left out, which older
 // Enterprise servers don't know). Pinned to the head commit, as merge is.
 func (c *ghClient) updateBranch(ctx context.Context, d *prDetail) error {
-	return c.graphql(ctx, `mutation($id: ID!, $oid: GitObjectID) {
+	return c.mutate(ctx, `mutation($id: ID!, $oid: GitObjectID) {
   updatePullRequestBranch(input: {pullRequestId: $id, expectedHeadOid: $oid}) { clientMutationId }
-}`, map[string]any{"id": d.ID, "oid": d.HeadRefOid}, nil)
+}`, map[string]any{"id": d.ID, "oid": d.HeadRefOid}, "updatePullRequestBranch", nil)
 }
 
 // dequeue takes the PR out of the merge queue.
 func (c *ghClient) dequeue(ctx context.Context, prID string) error {
-	return c.graphql(ctx, `mutation($id: ID!) { dequeuePullRequest(input: {id: $id}) { clientMutationId } }`,
-		map[string]any{"id": prID}, nil)
+	return c.mutate(ctx, `mutation($id: ID!) { dequeuePullRequest(input: {id: $id}) { clientMutationId } }`,
+		map[string]any{"id": prID}, "dequeuePullRequest", nil)
 }
 
 func (c *ghClient) disableAutoMerge(ctx context.Context, prID string) error {
-	return c.graphql(ctx, `mutation($id: ID!) { disablePullRequestAutoMerge(input: {pullRequestId: $id}) { clientMutationId } }`,
-		map[string]any{"id": prID}, nil)
+	return c.mutate(ctx, `mutation($id: ID!) { disablePullRequestAutoMerge(input: {pullRequestId: $id}) { clientMutationId } }`,
+		map[string]any{"id": prID}, "disablePullRequestAutoMerge", nil)
 }
 
 func (c *ghClient) deleteRef(ctx context.Context, refID string) error {
-	return c.graphql(ctx, `mutation($id: ID!) { deleteRef(input: {refId: $id}) { clientMutationId } }`,
-		map[string]any{"id": refID}, nil)
+	return c.mutate(ctx, `mutation($id: ID!) { deleteRef(input: {refId: $id}) { clientMutationId } }`,
+		map[string]any{"id": refID}, "deleteRef", nil)
 }
 
 // ── branch → PR, for the sidebar labels ───────────────────────────────────────

@@ -12,7 +12,9 @@ import (
 // code as a real one (diffFrom), from raw patches.
 
 // demoHead is a demo PR's head commit: fixed, 40 hex, like a real one.
-func demoHead(number int) string { return fmt.Sprintf("deadbeef%032x", number) }
+// demoOldHead is the commit before it.
+func demoHead(number int) string    { return fmt.Sprintf("deadbeef%032x", number) }
+func demoOldHead(number int) string { return fmt.Sprintf("c0ffee00%032x", number) }
 
 // demoFile is a file as REST has it, and whether it's viewed to begin with.
 type demoFile struct {
@@ -23,6 +25,13 @@ type demoFile struct {
 type demoPRFiles struct {
 	files   []demoFile
 	threads []fileThread
+	// The viewer's pending review (nil when there's none), the IDs handed out
+	// so far, and how many of demoDrafts have arrived: see demo_review.go.
+	review  *demoReview
+	nextID  int
+	drafted int
+	// The viewer's latest submitted review, once one is (nil before).
+	submitted *submittedInfo
 }
 
 // patch builds a unified patch from hunks: each is its header's start lines
@@ -180,8 +189,10 @@ func (d *demoSource) addDemoFiles(h func(float64) time.Time) {
 	onFile := demoThread("PRRT_demo_5", png.Filename, 0, false, c("5", "priya", "Can we shrink this fixture? It's 600 KB for two lines of text.", 5, "submitted"))
 	onFile.Subject, onFile.OriginalLine = "file", 0
 
+	// Sam's pending review holds the one pending comment.
 	d.filesData["github.com/halcyon/notes-app#482"] = &demoPRFiles{
-		files: []demoFile{pkg, note, markers, legacy, proposal, engine, threeWay, png, tests},
+		review: &demoReview{ID: "PRR_demo_482", Commit: demoHead(482)},
+		files:  []demoFile{pkg, note, markers, legacy, proposal, engine, threeWay, png, tests},
 		threads: []fileThread{
 			demoThread("PRRT_demo_1", engine.Filename, 142, false,
 				c("1", "jonas", "Should this timeout be shorter than the request's own? Otherwise we never see it fire.", 20, "submitted"),
@@ -202,7 +213,15 @@ func (d *demoSource) addDemoFiles(h func(float64) time.Time) {
 		"+        Text(\"Receive your notes anywhere\")",
 		"     }",
 	}}))
-	d.filesData["github.com/halcyon/notes-app#480"] = &demoPRFiles{files: []demoFile{typo}}
+	// Maria's PR, which Sam started reviewing a commit ago: a comment on it
+	// now is refused until that review is sent or dropped.
+	d.filesData["github.com/halcyon/notes-app#480"] = &demoPRFiles{
+		files:  []demoFile{typo},
+		review: &demoReview{ID: "PRR_demo_480", Body: "Thanks for catching this.", Commit: demoOldHead(480)},
+		threads: []fileThread{demoThread("PRRT_demo_480_1", typo.Filename, 15, false,
+			threadComment{ID: "PRRC_demo_480_1", Author: "sam", Body: "The old spelling is in Localizable.strings too.", Created: h(1).UnixMilli(), State: "pending",
+				URL: "https://github.com/halcyon/notes-app/pull/480#discussion_r480_1"})},
+	}
 
 	for key, data := range d.filesData {
 		d.viewed[key] = map[string]string{}
@@ -230,7 +249,7 @@ func (d *demoSource) files(_ context.Context, r repoRef, number int) (filesAnswe
 	if p == nil {
 		return filesAnswer{}, fmt.Errorf("%s#%d isn't there", r, number)
 	}
-	out := filesAnswer{Head: p.HeadRefOid, Files: []fileEntry{}, Threads: []fileThread{}}
+	out := filesAnswer{threadsAnswer: d.threadsOf(p), Files: []fileEntry{}}
 	data := d.filesData[p.key()]
 	if data == nil {
 		return out, nil
@@ -247,10 +266,6 @@ func (d *demoSource) files(_ context.Context, r repoRef, number int) (filesAnswe
 			}
 		}
 		out.Files = append(out.Files, e)
-	}
-	for _, t := range data.threads {
-		t.Comments = append([]threadComment{}, t.Comments...)
-		out.Threads = append(out.Threads, t)
 	}
 	orderThreads(out.Files, out.Threads)
 	tallyThreads(out.Files, out.Threads)

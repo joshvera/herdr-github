@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -29,6 +30,20 @@ func decodeReq(t *testing.T, r *http.Request) gqlRequest {
 
 func reply(w http.ResponseWriter, data any) {
 	_ = json.NewEncoder(w).Encode(map[string]any{"data": data})
+}
+
+// mutationTopField finds the top-level field a mutation asks for.
+var mutationTopField = regexp.MustCompile(`^\s*mutation[^{]*\{\s*(\w+)`)
+
+// replyDone answers a mutation as GitHub does when it's done: its field
+// holds a payload (here an empty clientMutationId), not null.
+func replyDone(t *testing.T, w http.ResponseWriter, req gqlRequest) {
+	t.Helper()
+	m := mutationTopField.FindStringSubmatch(req.Query)
+	if m == nil {
+		t.Fatalf("not a mutation: %.80s", req.Query)
+	}
+	reply(w, map[string]any{m[1]: map[string]any{"clientMutationId": nil}})
 }
 
 func prNode(n int) map[string]any {
@@ -226,10 +241,11 @@ func TestMergePinsTheHeadCommit(t *testing.T) {
 	var got []gqlRequest
 	var mu sync.Mutex
 	fakeGitHub(t, func(w http.ResponseWriter, r *http.Request) {
+		req := decodeReq(t, r)
 		mu.Lock()
-		got = append(got, decodeReq(t, r))
+		got = append(got, req)
 		mu.Unlock()
-		reply(w, map[string]any{})
+		replyDone(t, w, req)
 	})
 	c := newClient("github.com")
 	d := &prDetail{HeadRefOid: "abc123"}
@@ -251,8 +267,9 @@ func TestMergePinsTheHeadCommit(t *testing.T) {
 func TestDraftMutations(t *testing.T) {
 	var queries []string
 	fakeGitHub(t, func(w http.ResponseWriter, r *http.Request) {
-		queries = append(queries, decodeReq(t, r).Query)
-		reply(w, map[string]any{})
+		req := decodeReq(t, r)
+		queries = append(queries, req.Query)
+		replyDone(t, w, req)
 	})
 	c := newClient("github.com")
 	_ = c.setDraft(context.Background(), "PR_1", true)
@@ -357,10 +374,11 @@ func TestQueueMutations(t *testing.T) {
 	var got []gqlRequest
 	var mu sync.Mutex
 	fakeGitHub(t, func(w http.ResponseWriter, r *http.Request) {
+		req := decodeReq(t, r)
 		mu.Lock()
-		got = append(got, decodeReq(t, r))
+		got = append(got, req)
 		mu.Unlock()
-		reply(w, map[string]any{})
+		replyDone(t, w, req)
 	})
 	c := newClient("github.com")
 	d := &prDetail{HeadRefOid: "abc123"}
@@ -383,8 +401,9 @@ func TestQueueMutations(t *testing.T) {
 func TestUpdateBranchPinsTheHeadCommit(t *testing.T) {
 	var got []gqlRequest
 	fakeGitHub(t, func(w http.ResponseWriter, r *http.Request) {
-		got = append(got, decodeReq(t, r))
-		reply(w, map[string]any{})
+		req := decodeReq(t, r)
+		got = append(got, req)
+		replyDone(t, w, req)
 	})
 	d := &prDetail{HeadRefOid: "abc123"}
 	d.ID = "PR_1"
