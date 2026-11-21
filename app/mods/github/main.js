@@ -22,6 +22,7 @@ import { reviewChip } from "./follow.js";
 import { noteLines, whoChangedSays } from "./sent.js";
 import { askSignedIn, mayLook } from "./reads.js";
 import { Store } from "./store.js";
+import { modKey } from "./modkeys.js";
 import { whoOf, sameWho, mergeWho, empty, seed, listPatch, resolveRepo, pickedRepo, staleMark, stamper, takesOver, canAct } from "./cache.js";
 
 // The herdr-github this mod is part of (its release; the repo's tests hold it
@@ -360,12 +361,14 @@ export default class GitHub extends View {
     });
 
     // Key bindings and `herdr-app do`: github.escape, github.tab,
-    // github.backtab, github.demo, github.next, github.prev, github.reload.
+    // github.backtab, github.demo, github.next, github.prev, github.reload,
+    // github.close (⌘G here) and github.linear (⌘L here; see modkeys.js).
     // keys.json binds tab and shift-tab here: the app keeps them otherwise.
     cx.spawn(async (cx) => {
       for (;;) {
         const c = await nextCommand();
         if (c === "escape") this.escape(cx);
+        else if (c === "close" || c === "linear") this.modKeyPressed(c === "close" ? "github" : c);
         else if (c === "tab" || c === "backtab") this.press(c === "tab" ? "tab" : "shift-tab", cx);
         else if (c === "demo") {
           this.demo = !this.demo;
@@ -1051,6 +1054,15 @@ export default class GitHub extends View {
   dismiss() {
     this.closing = true;
     closeOverlay(props().overlay);
+  }
+
+  // ⌘G or ⌘L on this view (modkeys.js): its own key closes it, Linear's
+  // goes back to the issue it came from, if it came from one.
+  modKeyPressed(pressed) {
+    const k = modKey("github", pressed, this.backTo);
+    if (k.close) this.dismiss();
+    if (k.open) openOverlay({ mod: k.open.mod, kind: "dialog", width: 0.8, height: 0.8, props: k.open.props ?? {} });
+    if (k.toggle) run("mod.open", { name: k.toggle });
   }
 
   open(url, cx) {
